@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 import pytest
 from PySide6.QtCore import QObject, Signal, QPoint, Qt
 from PySide6.QtWidgets import QListView
+from PySide6.QtGui import QColor,QPainter,QPixmap
 
 from fotoarchive.browse_reader import BrowseReader
 from fotoarchive.catalog import Catalog
@@ -47,9 +48,15 @@ def stack_window(qtbot, tmp_path):
         cat.db.executemany('''INSERT INTO assets(id,source_id,relative_path,path_key,path,folder,filename,
             extension,size,mtime_ns,metadata_ready,width,height,captured_at,camera,media_kind,updated_at)
             VALUES(?,?,?,?,?,?,?,'.jpg',100,0,1,?,?,?,'camera','photo',0)''',records)
+        cat.db.execute("UPDATE assets SET thumbnail='synthetic-'||(id%3)")
     cat.close()
     backend = ReaderBackend(cfg)
     w = MainWindow(cfg,backend)
+    for i,color in enumerate(('#dfb465','#75a69b','#86a5c4')):
+        pix=QPixmap(160,120);pix.fill(QColor(color))
+        painter=QPainter(pix);painter.setPen(Qt.black)
+        painter.drawLine(0,0,159,119);painter.drawEllipse(40,30,70,70);painter.end()
+        w.model.cache['synthetic-'+str(i)]=pix
     qtbot.addWidget(w)
     w.resize(1480,940)
     w.thumbnail_size.setValue(152)
@@ -119,7 +126,7 @@ def test_stack_holds_identical_pixels_until_new_cells_are_ready(qtbot,stack_wind
     qtbot.wait(20)
     motion=w.gallery.stack_motion
     assert motion.snapshot.toImage()==before
-    after=w.gallery.viewport().grab().toImage()
+    after=w.gallery.grab(w.gallery.viewport().geometry()).toImage()
     import numpy as np
     a=np.frombuffer(before.bits(),dtype=np.uint8).reshape(before.height(),before.width(),4)
     b=np.frombuffer(after.bits(),dtype=np.uint8).reshape(after.height(),after.width(),4)
@@ -132,7 +139,7 @@ def test_stack_holds_identical_pixels_until_new_cells_are_ready(qtbot,stack_wind
     w.gallery.viewport().update()
     w.gallery.finish_stack_transition()
     assert motion.new is None
-    assert w.gallery.viewport().grab().toImage()==before
+    assert w.gallery.grab(w.gallery.viewport().geometry()).toImage()==before
     w.gallery.stop_stack_transition()
 
 

@@ -6,7 +6,7 @@ import os
 
 datas = [('fotoarchive/assets', 'fotoarchive/assets')]
 binaries = []
-hiddenimports = ['truststore']
+hiddenimports = ['truststore', 'comtypes.gen.UIAutomationClient', 'comtypes.gen.stdole']
 datas += collect_data_files('certifi')
 tmp_ret = collect_all('onnxruntime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

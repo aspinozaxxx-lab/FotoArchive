@@ -20,6 +20,7 @@ class ImageTask(QRunnable):
 class PhotoModel(QAbstractListModel):
     AssetRole = Qt.UserRole + 1
     PixmapRole = Qt.UserRole + 2
+    PROVIDED_ROLES = frozenset((Qt.DisplayRole, Qt.ToolTipRole, AssetRole, PixmapRole))
     pageRequested = Signal(int)
     assetsReady = Signal(int, int)
     countChanged = Signal()
@@ -141,7 +142,7 @@ class PhotoModel(QAbstractListModel):
         # Layout/font/alignment probes cover offscreen rows too. They must not
         # fetch records for roles this model does not provide, or deep views
         # continuously evict the very page the user is looking at.
-        if not index.isValid() or role not in (Qt.DisplayRole,Qt.ToolTipRole,self.AssetRole,self.PixmapRole):
+        if role not in self.PROVIDED_ROLES or not index.isValid():
             return None
         asset = self.asset(index.row())
         if not asset:

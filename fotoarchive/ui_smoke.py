@@ -9,6 +9,8 @@ def run(folder):
     os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
     os.environ.setdefault('QT_QPA_FONTDIR',str(Path(os.environ.get('WINDIR',r'C:\Windows'))/'Fonts'))
     from PySide6.QtCore import QObject,Signal
+    from PySide6.QtCore import QCoreApplication,Qt
+    QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     from PySide6.QtGui import QColor,QPixmap
     from PySide6.QtWidgets import QApplication,QListView
     from .config import Settings
@@ -42,8 +44,8 @@ def run(folder):
     w.resize(1300,900)
     w.show()
     report=dict(version=__version__,passed=False,checks=[],scope='generated rows and isolated synthetic SQLite; no real catalogue, models or source files')
-    def pump(predicate):
-        deadline=time.monotonic()+5
+    def pump(predicate,timeout=5):
+        deadline=time.monotonic()+timeout
         while not predicate():
             app.processEvents()
             if time.monotonic()>deadline: raise TimeoutError('Qt layout or animation stalled')
@@ -139,6 +141,26 @@ def run(folder):
                     error=max(abs(after.x()-before.x()),abs(after.y()-before.y()))
                     assert error==0, (mode,row,expanded,error,(before.x(),before.y()),(after.x(),after.y()))
                     report['async_checks'].append(dict(mode=mode,row=row,expanded=expanded,anchor_error_px=error))
+        # Detailed WebGL rendering is tested in a native Windows process by
+        # --map-smoke-test. The offscreen Qt plugin has no working D3D context.
+        w.details_toggle.setChecked(False);app.processEvents();w.details_toggle.setChecked(True);app.processEvents()
+        assert w.splitter.sizes()[2]>=260
+        report['details_panel']=True
+        # Resolve bundled COM wrappers in an isolated worker without opening
+        # Telegram, reading chats or preparing an attachment.
+        from concurrent.futures import ThreadPoolExecutor
+        def check_telegram_runtime():
+            from pywinauto import Desktop
+            import comtypes
+            comtypes.CoInitializeEx(comtypes.COINIT_MULTITHREADED)
+            try:
+                desktop=Desktop(backend='uia')
+                from comtypes.gen import UIAutomationClient
+                return bool(desktop and UIAutomationClient.CUIAutomation)
+            finally:comtypes.CoUninitialize()
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            report['telegram_runtime']=pool.submit(check_telegram_runtime).result(timeout=15)
+        assert report['telegram_runtime']
         report['passed']=True
     except Exception as exc:
         report['error']=repr(exc)

@@ -3,7 +3,7 @@ from PySide6.QtCore import Qt, QUrl, QRectF, QTimer
 from PySide6.QtGui import QPainter, QColor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QListWidget, QListWidgetItem, QScrollArea, QWidget
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QListWidget, QListWidgetItem, QScrollArea, QWidget, QStyle, QStyleOptionSlider
 
 from .video import timestamp_text, asset_at_moment, search_coverage_text
 
@@ -12,6 +12,34 @@ class MomentSlider(QSlider):
     def __init__(self,moments,parent=None):
         super().__init__(Qt.Horizontal,parent)
         self.moments = moments
+
+    def seek_at(self,point):
+        option=QStyleOptionSlider();self.initStyleOption(option)
+        groove=self.style().subControlRect(QStyle.CC_Slider,option,QStyle.SC_SliderGroove,self)
+        handle=self.style().subControlRect(QStyle.CC_Slider,option,QStyle.SC_SliderHandle,self)
+        value=QStyle.sliderValueFromPosition(self.minimum(),self.maximum(),
+            round(point.x()-groove.x()-handle.width()/2),max(1,groove.width()-handle.width()),option.upsideDown)
+        self.setSliderPosition(value)
+
+    def mousePressEvent(self,event):
+        if event.button()==Qt.LeftButton:
+            self.setSliderDown(True)
+            self.seek_at(event.position())
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self,event):
+        if self.isSliderDown():
+            self.seek_at(event.position());event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self,event):
+        if event.button()==Qt.LeftButton and self.isSliderDown():
+            self.seek_at(event.position());self.setSliderDown(False);event.accept()
+        else:
+            super().mouseReleaseEvent(event)
 
     def paintEvent(self,event):
         super().paintEvent(event)
@@ -51,6 +79,9 @@ class VideoPlayerDialog(QDialog):
         frame = QPushButton('Найденный кадр · лица')
         frame.clicked.connect(self.show_frame)
         controls.addWidget(frame)
+        from .telegram_share import ShareButton
+        self.share_button=ShareButton(cfg,lambda:self.asset,self)
+        controls.addWidget(self.share_button)
         layout.addLayout(controls)
         if moments:
             scroller = QScrollArea()

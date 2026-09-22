@@ -17,7 +17,8 @@ from fotoarchive.config import Settings
 from fotoarchive.catalog import Catalog,Filters
 from fotoarchive.browse_reader import BrowseViews,BrowseReader
 from fotoarchive.library import Library,LibraryReader
-from PySide6.QtCore import QObject,Signal,QTimer,QEvent
+from PySide6.QtCore import QObject,Signal,QTimer,QEvent,QCoreApplication,Qt
+QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
 from PySide6.QtWidgets import QApplication
 from fotoarchive.ui import MainWindow
 
@@ -134,11 +135,24 @@ class TestBackend(QObject):
     def close(self):
         self.reader.close();self.library.close()
 
-app=QApplication([])
+slow_events=[]
+class MeasuredApplication(QApplication):
+    def notify(self,target,event):
+        started=time.perf_counter()
+        result=super().notify(target,event)
+        elapsed=time.perf_counter()-started
+        if elapsed>.06 and len(slow_events)<100:
+            slow_events.append(dict(seconds=elapsed,target=type(target).__name__,name=target.objectName(),event=int(event.type())))
+        return result
+app=MeasuredApplication([]) if os.environ.get('FOTOARCHIVE_BENCHMARK_PROFILE') else QApplication([])
 app.setStyle('Fusion')
 backend=TestBackend()
 window=MainWindow(cfg,backend)
 window.resize(1480,940)
+map_cache=os.environ.get('FOTOARCHIVE_BENCHMARK_MAP_CACHE')
+if map_cache:
+    window.map_widget.data_dir=Path(map_cache)
+    window.setWindowTitle('FotoArchive — нагрузочная проверка 200 000')
 window.show()
 window.on_event(dict(type='ready',facets=facets,includes=cfg.includes))
 ticks=[]
@@ -184,6 +198,11 @@ def pump(predicate,timeout=20):
     for _ in range(12): app.processEvents();time.sleep(.002)
 pump(lambda:awaiting[0]==-1)
 initial_paint=paint_latencies.pop()
+if map_cache:
+    window.map_toggle.setChecked(True)
+    pump(lambda:window.map_widget.ready,timeout=40)
+    ticks.clear();last[0]=time.perf_counter()
+    report['detailed_map_visible']=True
 for i in range(30):
     started_at[0]=time.perf_counter()
     window.media_combo.setCurrentIndex((window.media_combo.currentIndex()+1)%3)
@@ -218,6 +237,9 @@ report['scroll_event_p95_seconds']=float(np.percentile(scroll_times,95))
 report['bounded_cache']={'pages':len(window.model.blocks),'images':len(window.model.cache),'image_tasks':len(window.model.requested)}
 # Real asynchronous stack requests deep in the catalogue, including variable
 # widths. A correct row ID alone is not enough: its screen position must stay.
+if os.environ.get('FOTOARCHIVE_BENCHMARK_PROFILE'):
+    import cProfile,pstats
+    profile=cProfile.Profile();profile.enable()
 stack_timings=[]
 stack_errors=[]
 motion_gaps=[]
@@ -244,6 +266,9 @@ for layout_mode in (0,1,2):
         after=window.gallery.visualRect(window.model.index(row)).topLeft()
         stack_errors.append(max(abs(after.x()-before.x()),abs(after.y()-before.y())))
         motion_gaps.extend(ticks[tick_start:])
+if os.environ.get('FOTOARCHIVE_BENCHMARK_PROFILE'):
+    profile.disable();pstats.Stats(profile).sort_stats('cumulative').print_stats(32)
+    report['slow_events']=slow_events
 report['stack_motion']=dict(samples=stack_timings,max_anchor_error_px=max(stack_errors),
     restore_p95_seconds=float(np.percentile([s['restore_seconds'] for s in stack_timings],95)),
     total_p95_seconds=float(np.percentile([s['total_seconds'] for s in stack_timings],95)),
@@ -273,7 +298,10 @@ report['last_request_won']=(window.request_id==last_request and window.filters()
 report['qt']={'initial_paint_seconds':initial_paint,'filter_paint_p95_seconds':float(np.percentile(paint_latencies[3:],95)),
     'filter_paint_max_seconds':max(paint_latencies[3:]),'event_loop_gap_p95_seconds':float(np.percentile(switch_ticks,95)),
     'event_loop_gap_max_seconds':max(switch_ticks),'rss_mib':psutil.Process().memory_info().rss/1024**2,
-    'method':'completed offscreen Qt paint with all visible thumbnails decoded (256 distinct images), concurrent catalogue writer; event-loop gaps cover startup and media switches only'}
+    'method':('native with detailed map; ' if map_cache else 'offscreen; ')+'completed Qt paint with all visible thumbnails decoded (256 distinct images), concurrent catalogue writer; event-loop gaps cover startup and media switches only'}
+if map_cache:
+    process=psutil.Process()
+    report['qt']['rss_with_map_children_mib']=sum(p.memory_info().rss for p in [process]+process.children(recursive=True))/1024**2
 window.close()
 stop.set();thread.join(5)
 backend.reader.thread.join(5);backend.library.thread.join(5)

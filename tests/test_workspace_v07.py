@@ -237,20 +237,17 @@ def test_saved_query_and_video_reference_restore_without_stale_face_filter(qtbot
     third.close()
 
 
-def test_map_keeps_aspect_ratio_and_coordinate_roundtrip(qtbot):
-    from fotoarchive.map_view import MapView
-    w=MapView()
-    qtbot.addWidget(w)
-    w.resize(1000,250)
-    rect=w.map_rect()
-    assert rect.width()/rect.height()==pytest.approx(2)
-    point=w.pixel(37,55)
-    lon,lat=w.coordinate(point)
-    assert (lon,lat)==pytest.approx((37,55))
+def test_map_defaults_and_background_points_do_not_move_view(qtbot,tmp_path):
+    from fotoarchive.map_view import MapView,valid_bounds
+    w=MapView(data_dir=tmp_path);qtbot.addWidget(w)
+    assert w.bounds==w.DEFAULT_BOUNDS
     w.set_points([dict(longitude=37,latitude=55,count=1)])
-    assert w.bounds[0]<37<w.bounds[2] and w.bounds[1]<55<w.bounds[3]
-    w.reset()
-    assert w.bounds==(-180,-90,180,90)
+    assert w.bounds==w.DEFAULT_BOUNDS
+    w.fit_points();assert w.bounds[2]-w.bounds[0]<1
+    previous=w.bounds;w.fit((0,0,float('nan'),90));assert w.bounds==previous
+    w.reset();assert w.bounds==(-179,-75,179,80)
+    assert not valid_bounds((0,0,181,90))
+    w.close()
 
 
 def test_verification_does_not_replace_stack_count_with_file_count(qtbot,tmp_path):

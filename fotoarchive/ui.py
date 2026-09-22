@@ -213,13 +213,26 @@ class Viewer(QDialog):
         self.resize(1200, 820)
         layout = QVBoxLayout(self)
         top = QHBoxLayout()
-        for title, fn in [("← Предыдущая", lambda: self.navigate(-1)), ("Следующая →", lambda: self.navigate(1)), ("Вписать", self.fit), ("100%", self.actual), ("Оригинал", self.open_original)]:
-            button = QPushButton(title)
+        from .icons import symbol_icon
+        self.controls = {}
+        for name,title,fn in [('previous','Предыдущая · ←',lambda:self.navigate(-1)),
+                              ('next','Следующая · →',lambda:self.navigate(1)),
+                              ('fit','Вписать в окно',self.fit),('actual','100% · исходный размер',self.actual),
+                              ('original','Открыть оригинал',self.open_original)]:
+            button = QPushButton()
+            button.setIcon(symbol_icon(name));button.setIconSize(QSize(24,24))
+            button.setFixedSize(40,36)
+            button.setStyleSheet('QPushButton { padding: 4px; }')
+            button.setToolTip(title);button.setAccessibleName(title)
             button.clicked.connect(fn)
             top.addWidget(button)
-        self.label = QLabel()
+            self.controls[name]=button
+        self.label = ElideLabel()
         self.label.setTextFormat(Qt.PlainText)
         top.addWidget(self.label, 1)
+        from .telegram_share import ShareButton
+        self.share_button=ShareButton(cfg,lambda:self.asset,self)
+        top.addWidget(self.share_button)
         self.face_boxes_check = QCheckBox("Рамки лиц")
         self.face_boxes_check.setChecked(self.show_face_boxes)
         self.face_boxes_check.setToolTip("Скрытые рамки остаются доступными для нажатия на лицо")
@@ -255,7 +268,7 @@ class Viewer(QDialog):
             self.label.setText("Загрузка следующей части каталога…")
             return
         self.waiting = False
-        self.label.setText(f"Загрузка · {self.asset['filename']}")
+        self.label.setText(self.caption_text())
         if original:
             self.pool.start(PreviewTask(self.load_token, self.asset, self.cfg, True, self.preview_signals), 100)
         else:
@@ -339,9 +352,7 @@ class Viewer(QDialog):
             return
         self.original_loaded = original
         self.scene.clear()
-        self.label.setText(f"{self.position + 1} · {self.asset['filename']}")
-        if self.asset.get('media_kind') == 'video':
-            self.label.setText(self.asset['filename'] + ' · кадр ' + timestamp_text(self.asset.get('timestamp_ms')))
+        self.label.setText(self.caption_text())
         self.scene.addPixmap(QPixmap.fromImage(image))
         self.scene.setSceneRect(0, 0, image.width(), image.height())
         self.draw_faces()
@@ -360,6 +371,17 @@ class Viewer(QDialog):
             self.position = position
             self.load()
             self.items.fetchMore()
+
+    def caption_text(self):
+        from datetime import datetime
+        try:
+            date=datetime.fromisoformat(self.asset.get('captured_at') or '').strftime('%d.%m.%Y %H:%M:%S')
+        except (ValueError,TypeError):
+            date='Дата неизвестна'
+        text=f"{self.position + 1} · {self.asset['filename']} · {date}"
+        if self.asset.get('media_kind')=='video':
+            text+=' · кадр '+timestamp_text(self.asset.get('timestamp_ms'))
+        return text
 
     def fit(self):
         self.fit_mode = True
@@ -754,8 +776,17 @@ class MainWindow(Workspace, QMainWindow):
         map_layout = QVBoxLayout(self.map_panel)
         map_layout.setContentsMargins(0,0,0,0)
         from .map_view import MapView
-        self.map_widget = MapView()
+        self.map_widget = MapView(data_dir=self.cfg.data_dir)
         map_layout.addWidget(self.map_widget,1)
+        self.map_status = QLabel()
+        self.map_status.setObjectName('muted');self.map_status.hide()
+        self.map_status.setWordWrap(True)
+        self.map_retry=QPushButton('Повторить загрузку');self.map_retry.hide()
+        self.map_retry.clicked.connect(self.map_widget.retry)
+        self.map_widget.mapStatus.connect(self.update_map_status)
+        map_status_layout=QHBoxLayout()
+        map_status_layout.addWidget(self.map_status,1);map_status_layout.addWidget(self.map_retry)
+        map_layout.addLayout(map_status_layout)
         map_legend = QLabel('● Из файла  ·  синий — вручную  ·  фиолетовый — смешанная группа. Догадки модели на карту не наносятся.')
         map_legend.setObjectName('muted')
         map_legend.setWordWrap(True)
@@ -767,9 +798,13 @@ class MainWindow(Workspace, QMainWindow):
             button.clicked.connect(callback)
             map_actions.addWidget(button)
         map_layout.addLayout(map_actions)
-        self.map_panel.setMaximumHeight(330)
+        self.canvas_splitter=QSplitter(Qt.Vertical)
+        self.canvas_splitter.setChildrenCollapsible(False)
+        self.canvas_splitter.setHandleWidth(8)
+        self.canvas_splitter.setStyleSheet('QSplitter::handle:vertical { background: #b9cbc7; border-radius: 3px; height: 8px; }')
+        self.canvas_splitter.addWidget(self.map_panel)
+        self.canvas_splitter.splitterMoved.connect(self.remember_map_height)
         self.map_panel.hide()
-        layout.addWidget(self.map_panel)
         self.conditions_label = QLabel()
         self.conditions_label.setWordWrap(True)
         self.conditions_label.setTextFormat(Qt.PlainText)
@@ -799,7 +834,9 @@ class MainWindow(Workspace, QMainWindow):
         self.gallery.doubleClicked.connect(self.view_photo)
         open_shortcut = QShortcut(QKeySequence('Return'),self.gallery,activated=lambda:self.view_photo(self.gallery.currentIndex()))
         open_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        layout.addWidget(self.gallery, 1)
+        self.canvas_splitter.addWidget(self.gallery)
+        self.canvas_splitter.setStretchFactor(1,1)
+        layout.addWidget(self.canvas_splitter, 1)
         self.empty_label = QLabel("Здесь появятся фотографии. Нажмите «Добавить папки», чтобы начать.")
         self.empty_label.setWordWrap(True)
         self.empty_label.setAlignment(Qt.AlignCenter)
@@ -1602,6 +1639,7 @@ class MainWindow(Workspace, QMainWindow):
         self.navigation_timer.stop()
         self.folder_filter_timer.stop()
         self.map_delay.stop()
+        self.map_widget.close_resources()
         self.gallery.stop_hover()
         self.backend.close()
         self.model.pool.waitForDone(3000)

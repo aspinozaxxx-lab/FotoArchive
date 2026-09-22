@@ -146,8 +146,10 @@ class Workspace:
         panel_shortcut = QShortcut(QKeySequence('Tab'),self.gallery,activated=self.toggle_panels)
         panel_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         # Tab is not intercepted while editing text.
-        self.sidebar_toggle.toggled.connect(self.sidebar.setVisible)
-        self.details_toggle.toggled.connect(self.details_panel.setVisible)
+        self.sidebar_toggle.toggled.connect(lambda visible:self.show_side_panel(self.sidebar,visible))
+        self.details_toggle.toggled.connect(lambda visible:self.show_side_panel(self.details_panel,visible))
+        for panel in (self.sidebar,self.details_panel):
+            self.splitter.setCollapsible(self.splitter.indexOf(panel),False)
         self.processing_toggle.toggled.connect(self.processing_panel.setVisible)
         self.map_toggle.toggled.connect(self.toggle_map)
         self.stacks_check.toggled.connect(lambda _:self.search(preserve_position=True) if not self._restoring_controls else None)
@@ -317,7 +319,7 @@ class Workspace:
 
     def request_map(self):
         self.map_serial += 1
-        w,s,e,n = self.map_widget.bounds
+        w,s,e,n = map(float,self.map_widget.visible_bounds().split(','))
         action = 'search_places' if self.mode!='browse' and not self.loading else 'library_places'
         self.backend.send(action=action,id=self.request_id,serial=self.map_serial,filters=self.filters(),
                           viewport=self.map_widget.visible_bounds(),step=max(.0001,(e-w)/60))
@@ -531,15 +533,26 @@ class Workspace:
     def resize_thumbnails(self,*_):
         if not hasattr(self,'delegate'):
             return
-        anchor = self.capture_anchor()
+        self.gallery.preserve_view_position()
         self.gallery.stop_scroll()
         self.delegate.edge = self.thumbnail_size.value()
         self.delegate.proportions = self.layout_combo.currentIndex()==1
         self.delegate.full_frame = self.layout_combo.currentIndex()==2
         self.gallery.setUniformItemSizes(not self.delegate.proportions)
         self.gallery.doItemsLayout()
-        if anchor:
-            QTimer.singleShot(0,lambda:self.restore_gallery_position(anchor,self.request_id))
+        self.gallery.schedule_reflow()
+        self.save_context_timer.start()
+
+    def show_side_panel(self,panel,visible):
+        index=self.splitter.indexOf(panel)
+        sizes=self.splitter.sizes()
+        if not visible and sizes[index]>0:
+            panel.setProperty('expanded_width',sizes[index])
+        panel.setVisible(visible)
+        if visible:
+            sizes[index]=max(panel.minimumWidth(),panel.property('expanded_width') or 320)
+            sizes[1]=max(240,self.splitter.width()-sum(size for i,size in enumerate(sizes) if i!=1)-20)
+            self.splitter.setSizes(sizes)
         self.save_context_timer.start()
 
     def toggle_panels(self):
@@ -673,7 +686,18 @@ class Workspace:
     def toggle_map(self,visible):
         self.map_panel.setVisible(visible)
         if visible:
+            height=max(200,int(self.preferences.values.get('map_height',330)))
+            self.canvas_splitter.setSizes([height,max(180,self.canvas_splitter.height()-height)])
             self.request_map()
+
+    def remember_map_height(self,*_):
+        if self.map_panel.isVisible():
+            self.save_preferences(map_height=self.canvas_splitter.sizes()[0])
+
+    def update_map_status(self,status):
+        self.map_status.setText(status['message'])
+        self.map_status.setVisible(status['state']!='ready')
+        self.map_retry.setVisible(status['state']=='error')
 
     def select_map_bounds(self,bounds):
         self.geo_bounds = bounds
@@ -760,5 +784,6 @@ class Workspace:
                 style = style.replace(old,new)
         style += '\nQTreeWidget,QListWidget { border:0; background:transparent; } QTabWidget::pane { border:0; } QPushButton:checked { background:#177c70; color:white; }'
         app.setStyleSheet(style)
+        self.map_widget.set_theme(dark)
         if save:
             self.save_preferences(theme=theme)

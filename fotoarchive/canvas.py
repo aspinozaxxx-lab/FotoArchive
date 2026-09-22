@@ -42,8 +42,9 @@ class PhotoDelegate(QStyledItemDelegate):
             width = round(self.edge * max(.45, min(2.5,w/max(1,h))))
         return QSize(width, self.edge)
 
-    def badge(self, rect):
-        return QRect(rect.left()+8, rect.top()+8, 64, 26)
+    def badge(self, rect, asset, metrics):
+        width = 6 + 12 + 4 + metrics.horizontalAdvance(str(asset['stack_count'])) + 6
+        return QRect(rect.left()+6, rect.top()+6, width, max(22, metrics.height()+4))
 
     def moment_targets(self, rect, asset, metrics):
         moments = asset.get('matched_moments', [])
@@ -90,12 +91,15 @@ class PhotoDelegate(QStyledItemDelegate):
             p.setPen(Qt.white)
             p.drawText(QRect(rect.right()-27,rect.top()+5,22,22),Qt.AlignCenter,'✓')
         if asset.get('stack_count',0) > 1:
-            badge = self.badge(rect)
-            p.setBrush(QColor(20,30,34,210))
+            badge = self.badge(rect,asset,option.fontMetrics)
+            p.setBrush(QColor(74,88,96,205))
             p.setPen(Qt.NoPen)
             p.drawRoundedRect(badge,4,4)
+            from .icons import draw_symbol
+            draw_symbol(p,'collapse' if asset.get('stack_expanded') else 'stack',
+                        QRectF(badge.left()+6,badge.center().y()-6,12,12),QColor('white'))
             p.setPen(Qt.white)
-            p.drawText(badge,Qt.AlignCenter,('▾ ' if asset.get('stack_expanded') else '▤ ')+str(asset['stack_count']))
+            p.drawText(badge.adjusted(22,0,-6,0),Qt.AlignVCenter|Qt.AlignLeft,str(asset['stack_count']))
         if asset.get('media_kind') == 'video':
             badge = QRect(rect.left()+7,rect.bottom()-28,100,22)
             p.fillRect(badge,QColor(20,30,34,210))
@@ -113,7 +117,7 @@ class PhotoDelegate(QStyledItemDelegate):
                 if rect.contains(event.position().toPoint()):
                     self.momentOpened.emit(asset,moment)
                     return True
-            if asset.get('stack_count',0) > 1 and self.badge(option.rect.adjusted(2,2,-2,-2)).contains(event.position().toPoint()):
+            if asset.get('stack_count',0) > 1 and self.badge(option.rect.adjusted(2,2,-2,-2),asset,option.fontMetrics).contains(event.position().toPoint()):
                 self.stackToggled.emit(asset['stack_key'], index.row())
                 return True
         return super().editorEvent(event,model,option,index)
@@ -122,21 +126,19 @@ class PhotoDelegate(QStyledItemDelegate):
 class StackMotion(QWidget):
     """One viewport of transient pixels; no photo decoding or archive-sized list."""
     def __init__(self, gallery, key, origin):
-        super().__init__(gallery.viewport())
+        # A viewport child is moved by QWidget.scroll during model reset and
+        # anchor restoration, briefly exposing the empty underlying layout.
+        # A sibling stays above the viewport throughout that entire operation.
+        super().__init__(gallery)
         self.gallery, self.key, self.origin = gallery, key, QRectF(origin)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.setGeometry(gallery.viewport().rect())
+        self.setGeometry(gallery.viewport().geometry())
         # Preserve the actual styled viewport, including gutters. The palette's
         # Base colour is not the transparent list's background (in either theme).
         self.snapshot = gallery.viewport().grab()
         self.background = gallery.palette().window().color()
         self.background = self.snapshot.toImage().pixelColor(0, 0)
-        self.old = gallery.visible_cells()
-        for rect, _, _ in self.old.values():
-            point = QPoint(int(rect.left()+1),max(0,min(self.height()-1,int(rect.center().y()))))
-            if self.rect().contains(point):
-                self.background = self.snapshot.toImage().pixelColor(point)
-                break
+        self.old = gallery.visible_cells(snapshot=self.snapshot)
         self.new = None
         self.progress = 0.0
         self.animation = QVariantAnimation(self)
@@ -146,15 +148,12 @@ class StackMotion(QWidget):
         self.animation.setEasingCurve(QEasingCurve.OutCubic)
         self.animation.valueChanged.connect(self.advance)
         self.animation.finished.connect(self.hide)
-        self.expiry = QTimer(self)
-        self.expiry.setSingleShot(True)
-        self.expiry.timeout.connect(self.hide)
-        self.expiry.start(4000)
         self.ready_timer = QTimer(self)
         self.ready_timer.setInterval(16)
         self.ready_timer.timeout.connect(self.finish)
         self.ready_attempts = 0
         self.show()
+        self.raise_()
 
     def advance(self, value):
         self.progress = value
@@ -167,12 +166,11 @@ class StackMotion(QWidget):
         self.ready_attempts += 1
         # A reset can finish its layout before the page or thumbnails arrive.
         # Keep the exact old pixels until the replacement is actually drawable.
-        if not ready and self.ready_attempts < 120:
+        if not ready:
             self.ready_timer.start()
             return
         self.ready_timer.stop()
         self.new = cells
-        self.expiry.stop()
         self.animation.start()
 
     def paintEvent(self, event):
@@ -190,6 +188,8 @@ class StackMotion(QWidget):
             if new:
                 end, pixmap, stack = new
                 start = old[0] if old else self.origin if stack == self.key else end.translated(0, self.height())
+                if old and t < 1:
+                    pixmap = old[1]
                 opacity = 1.0 if old else t
             else:
                 start, pixmap, stack = old
@@ -212,6 +212,17 @@ class CanvasGallery(PhotoGallery):
         self.frames = []
         self.frame_number = 0
         self.stack_motion = None
+        self._view_anchor = None
+        self._reflow_anchor = None
+        self._restoring_layout = False
+        self._reflow_timer = QTimer(self)
+        self._reflow_timer.setSingleShot(True)
+        self._reflow_timer.timeout.connect(self.restore_view_position)
+        self._resize_settle = QTimer(self)
+        self._resize_settle.setSingleShot(True)
+        self._resize_settle.setInterval(150)
+        self._resize_settle.timeout.connect(self.finish_reflow)
+        self.verticalScrollBar().sliderPressed.connect(self.cancel_reflow)
         self.hover_delay = QTimer(self)
         self.hover_delay.setSingleShot(True)
         self.hover_delay.timeout.connect(lambda: self.hoverVideo.emit(self.hover_asset) if self.hover_asset else None)
@@ -225,10 +236,11 @@ class CanvasGallery(PhotoGallery):
             self.zoomRequested.emit(16 if event.angleDelta().y()>0 else -16)
             event.accept()
             return
+        self.cancel_reflow()
         self.stop_hover()
         super().wheelEvent(event)
 
-    def visible_cells(self, require_ready=False):
+    def visible_cells(self, require_ready=False, snapshot=None):
         indexes = set()
         edge = self.itemDelegate().edge
         for y in [*range(0, self.viewport().height(), max(1, edge//2)), self.viewport().height()-1]:
@@ -238,7 +250,11 @@ class CanvasGallery(PhotoGallery):
                     indexes.add(index.row())
         cells = {}
         ready = True
-        for row in sorted(indexes)[:120]:
+        # Capture actual styled/DPI-scaled pixels, rather than rerendering each
+        # card with a different font, palette or device pixel ratio.
+        snapshot = snapshot if snapshot is not None else self.viewport().grab()
+        dpr = snapshot.devicePixelRatio()
+        for row in sorted(indexes):
             index = self.model().index(row)
             asset = index.data(PhotoModel.AssetRole)
             rect = self.visualRect(index)
@@ -247,15 +263,11 @@ class CanvasGallery(PhotoGallery):
                 continue
             if asset.get('thumbnail') and index.data(PhotoModel.PixmapRole) is None and asset['thumbnail'] not in self.model().failed:
                 ready = False
-            option = QStyleOptionViewItem()
-            option.initFrom(self)
-            option.rect = QRect(QPoint(), rect.size())
-            if self.selectionModel().isSelected(index):
-                option.state |= QStyle.State_Selected
-            pixmap = QPixmap(rect.size())
+            pixmap = QPixmap(round(rect.width()*dpr),round(rect.height()*dpr))
+            pixmap.setDevicePixelRatio(dpr)
             pixmap.fill(Qt.transparent)
             painter = QPainter(pixmap)
-            self.itemDelegate().paint(painter, option, index)
+            painter.drawPixmap(-rect.topLeft(),snapshot)
             painter.end()
             cells[asset['id']] = (QRectF(rect), pixmap, asset.get('stack_key'))
         return (cells, ready and bool(cells)) if require_ready else cells
@@ -277,10 +289,104 @@ class CanvasGallery(PhotoGallery):
             self.stack_motion = None
 
     def resizeEvent(self, event):
+        self.preserve_view_position()
         self.stop_stack_transition()
         super().resizeEvent(event)
+        self.schedule_reflow()
+
+    def event(self,event):
+        changing = event.type() in (QEvent.ScreenChangeInternal,QEvent.DevicePixelRatioChange,
+                                   QEvent.FontChange,QEvent.StyleChange)
+        if changing and hasattr(self,'_reflow_timer'):
+            self.preserve_view_position()
+        result = super().event(event)
+        if changing and hasattr(self,'_reflow_timer'):
+            self.schedule_reflow()
+        return result
+
+    def setModel(self,model):
+        previous = self.model()
+        if previous is not None:
+            previous.modelAboutToBeReset.disconnect(self.cancel_reflow)
+        super().setModel(model)
+        if model is not None:
+            model.modelAboutToBeReset.connect(self.cancel_reflow)
+
+    def remember_view_position(self):
+        if self._reflow_anchor or not self.model() or not self.model().rowCount():
+            return
+        edge = self.itemDelegate().edge
+        for y in (2,8,min(edge//2,self.viewport().height()-1)):
+            for x in range(4,self.viewport().width(),max(4,edge//4)):
+                index = self.indexAt(QPoint(x,y))
+                if index.isValid():
+                    rect = self.visualRect(index)
+                    self._view_anchor = dict(row=index.row(),fraction=rect.y()/max(1,rect.height()))
+                    return
+
+    def preserve_view_position(self):
+        if not self._reflow_anchor and self._view_anchor:
+            self._reflow_anchor = dict(self._view_anchor)
+            self.stop_scroll()
+            self._append_range_floor = self.verticalScrollBar().maximum()
+
+    def schedule_reflow(self):
+        if self._reflow_anchor:
+            self._reflow_timer.start(0)
+            self._resize_settle.start()
+
+    def restore_view_position(self):
+        anchor = self._reflow_anchor
+        if not anchor or not self.model() or not self.model().rowCount():
+            return
+        rect = self.visualRect(self.model().index(min(anchor['row'],self.model().rowCount()-1)))
+        last = self.visualRect(self.model().index(self.model().rowCount()-1))
+        if not rect.isValid() or not last.isValid():
+            self._reflow_timer.start(16)
+            return
+        self._restoring_layout = True
+        try:
+            bar = self.verticalScrollBar()
+            # The old range only protects the intermediate batches. Once all
+            # rows have geometry it must be allowed to shrink as well as grow.
+            self._append_range_floor = None
+            super().updateGeometries()
+            bar.setValue(bar.value()+rect.y()-round(anchor['fraction']*rect.height()))
+        finally:
+            self._restoring_layout = False
+
+    def finish_reflow(self):
+        self.restore_view_position()
+        if self._reflow_timer.isActive():
+            self._resize_settle.start()
+            return
+        self._reflow_anchor = None
+        self.remember_view_position()
+
+    def cancel_reflow(self):
+        self._reflow_timer.stop()
+        self._resize_settle.stop()
+        self._reflow_anchor = self._view_anchor = None
+
+    def scrollContentsBy(self,dx,dy):
+        super().scrollContentsBy(dx,dy)
+        if hasattr(self,'_reflow_anchor') and not self._restoring_layout:
+            self.remember_view_position()
+
+    def scrollTo(self,index,hint=PhotoGallery.EnsureVisible):
+        # Explicit navigation takes precedence over a resize still settling.
+        if not hasattr(self,'_reflow_timer'):
+            return super().scrollTo(index,hint)
+        self.cancel_reflow()
+        super().scrollTo(index,hint)
+        self.remember_view_position()
+
+    def paintEvent(self,event):
+        super().paintEvent(event)
+        self.remember_view_position()
 
     def mousePressEvent(self, event):
+        self.cancel_reflow()
         self.stop_stack_transition()
         super().mousePressEvent(event)
 
@@ -307,6 +413,7 @@ class CanvasGallery(PhotoGallery):
         super().leaveEvent(event)
 
     def keyPressEvent(self, event):
+        self.cancel_reflow()
         self.stop_stack_transition()
         self.stop_hover()
         super().keyPressEvent(event)
