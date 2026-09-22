@@ -11,8 +11,14 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--media-smoke-test", action="store_true")
     parser.add_argument('--browse-benchmark', action='store_true', help='Measure catalogue reads without opening or changing the library')
+    parser.add_argument('--ui-smoke-test', action='store_true', help='Check the packaged Qt gallery with generated records, without a catalogue or GPU')
     parser.add_argument("--analyze-orientation", action="store_true", help="Start/resume recommendations for the already indexed photos")
     args = parser.parse_args()
+    if args.ui_smoke_test:
+        if not args.data_dir:
+            parser.error('--ui-smoke-test requires an isolated --data-dir for its report')
+        from .ui_smoke import run
+        return run(Path(args.data_dir))
     if args.browse_benchmark:
         from .config import Settings
         from .browse_benchmark import run

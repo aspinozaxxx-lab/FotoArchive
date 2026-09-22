@@ -689,7 +689,8 @@ class MainWindow(Workspace, QMainWindow):
         self.timeline_combo.setMaximumWidth(200)
         period.addWidget(self.timeline_combo)
         self.layout_combo = QComboBox()
-        self.layout_combo.addItems(['Плотно','Пропорции'])
+        self.layout_combo.addItems(['Плотно','Пропорции','Целиком'])
+        self.layout_combo.setToolTip('Целиком — одинаковые ячейки без обрезки кадра')
         period.addWidget(self.layout_combo)
         self.thumbnail_size = QSlider(Qt.Horizontal)
         self.thumbnail_size.setRange(120,420)
@@ -704,6 +705,10 @@ class MainWindow(Workspace, QMainWindow):
         from .map_view import MapView
         self.map_widget = MapView()
         map_layout.addWidget(self.map_widget,1)
+        map_legend = QLabel('● Из файла  ·  синий — вручную  ·  фиолетовый — смешанная группа. Догадки модели на карту не наносятся.')
+        map_legend.setObjectName('muted')
+        map_legend.setWordWrap(True)
+        map_layout.addWidget(map_legend)
         map_actions = QHBoxLayout()
         for label,callback in [('Искать в этой области',lambda:self.select_map_bounds(self.map_widget.visible_bounds())),
                                ('Снять область',lambda:self.select_map_bounds('')),('К снимкам',self.map_widget.fit_points),('Весь мир',self.map_widget.reset)]:
@@ -740,12 +745,19 @@ class MainWindow(Workspace, QMainWindow):
         self.gallery.setItemDelegate(self.delegate)
         self.gallery.selectionModel().currentChanged.connect(self.select_photo)
         self.gallery.doubleClicked.connect(self.view_photo)
+        open_shortcut = QShortcut(QKeySequence('Return'),self.gallery,activated=lambda:self.view_photo(self.gallery.currentIndex()))
+        open_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         layout.addWidget(self.gallery, 1)
         self.empty_label = QLabel("Здесь появятся фотографии. Нажмите «Добавить папки», чтобы начать.")
         self.empty_label.setWordWrap(True)
         self.empty_label.setAlignment(Qt.AlignCenter)
         self.empty_label.setObjectName("muted")
         layout.addWidget(self.empty_label)
+        self.empty_actions = QWidget()
+        self.empty_actions_layout = QHBoxLayout(self.empty_actions)
+        self.empty_actions_layout.setContentsMargins(0,0,0,0)
+        layout.addWidget(self.empty_actions)
+        self.empty_actions.hide()
         bottom = QHBoxLayout()
         bottom.addStretch()
         self.more_button = QPushButton("Проверить ещё 40")
@@ -846,8 +858,13 @@ class MainWindow(Workspace, QMainWindow):
         anchor = self.before_workspace_search(preserve_position)
         self.gallery.stop_hover()
         self.request_id += 1
+        if not self._stack_change or self._stack_change['request_id'] != self.request_id:
+            self._stack_change = None
+            self.gallery.stop_stack_transition()
         self.view_id = 0
         self.loading = True
+        if not self.model.rowCount():
+            self.show_items()
         self.refresh_results_button.hide()
         self.more_button.setEnabled(False)
         self.cancel_button.setVisible(False)
@@ -902,12 +919,19 @@ class MainWindow(Workspace, QMainWindow):
         if request_id != self.request_id or not self.model.rowCount():
             return
         row = min(restore['row'], self.model.rowCount() - 1)
-        if not self.gallery.visualRect(self.model.index(row)).isValid() and attempt < 100:
+        # In a batched QListView the anchor can already have a rectangle while
+        # the scroll range still covers only the first batch. Wait for the last
+        # row as well; otherwise the scrollbar clamps and the next batch jumps.
+        if (not self.gallery.visualRect(self.model.index(row)).isValid() or
+                not self.gallery.visualRect(self.model.index(self.model.rowCount()-1)).isValid()) and attempt < 100:
             QTimer.singleShot(20, lambda: self.restore_gallery_position(restore, request_id, attempt + 1))
             return
-        self.gallery.scrollTo(self.model.index(row), QListView.PositionAtTop)
         bar = self.gallery.verticalScrollBar()
-        bar.setValue(bar.value() - restore.get('offset_y', 0))
+        self.gallery.stop_scroll()
+        bar.setValue(bar.value() + self.gallery.visualRect(self.model.index(row)).y() - restore.get('offset_y', 0))
+        if self._stack_change and self._stack_change['request_id'] == request_id:
+            self._stack_change = None
+            self.gallery.finish_stack_transition()
 
     def clear_query(self):
         self.selected_people = []
@@ -1063,8 +1087,38 @@ class MainWindow(Workspace, QMainWindow):
     def show_items(self):
         count = self.model.rowCount()
         self.empty_label.setVisible(not count)
+        self.empty_actions.setVisible(not count and not self.loading)
         if not count:
-            self.empty_label.setText("В этой группе пока нет фотографий." if self.conditions else "Фотографий не найдено. Измените запрос или фильтры.")
+            while self.empty_actions_layout.count():
+                child = self.empty_actions_layout.takeAt(0)
+                if child.widget():
+                    child.widget().deleteLater()
+            entries = getattr(self,'_filter_entries',[])
+            actions = []
+            if self.loading:
+                text = 'Ищу материалы…'
+            elif self.model.has_more:
+                text = 'В просмотренной части кандидатов совпадений пока нет. Можно продолжить поиск.'
+                actions.append(('Продолжить поиск',lambda:self.model.fetchMore()))
+            elif self.conditions and self.verdict_combo.currentData():
+                text = 'В этой группе пока нет материалов. Посмотрите всех кандидатов или продолжите проверку условий.'
+                actions.append(('Все кандидаты',lambda:self.verdict_combo.setCurrentIndex(0)))
+            elif entries:
+                text = 'По этим условиям материалов не найдено. Попробуйте снять один из фильтров; остальные сохранятся.'
+            else:
+                text = 'Здесь пока нет готовых материалов. Добавьте папки или дождитесь подготовки каталога.'
+                actions.append(('Добавить папки',self.add_folder))
+            if not self.loading:
+                actions += [('Снять: '+title,remove) for title,remove,_ in entries[:3]]
+            self.empty_label.setText(text)
+            self.empty_actions_layout.addStretch()
+            for title,callback in actions:
+                button = QPushButton(title)
+                button.setMaximumWidth(250)
+                button.setToolTip(title)
+                button.clicked.connect(callback)
+                self.empty_actions_layout.addWidget(button)
+            self.empty_actions_layout.addStretch()
         total = self.model.known_total
         suffix = "+" if self.model.has_more else ""
         noun = "совпадений лиц" if self.mode == "face" else "в группе" if self.conditions else "файлов"
@@ -1097,13 +1151,21 @@ class MainWindow(Workspace, QMainWindow):
                   f"<p>{asset['width']} × {asset['height']} · {asset['extension'].upper().lstrip('.')} · {asset['size']/1024**2:.2f} МБ</p>",
                   f"<p>{html.escape(asset.get('camera') or 'Камера не указана')}</p>"]
         if asset.get('media_kind') == 'video':
+            from .video import search_coverage_text
             blocks.append(f"<p><b>Видео · {timestamp_text(asset.get('duration_ms'))}</b><br>Найденный кадр: {timestamp_text(asset.get('timestamp_ms'))}. "
-                          'Поиск по кадрам через 10 секунд; короткие события между ними могут быть пропущены.</p>')
+                          +html.escape(search_coverage_text(asset))+'</p>')
         if asset.get("geo_text") or asset.get("latitude") is not None:
             location = html.escape(asset.get("geo_text") or "")
             if asset.get("latitude") is not None:
                 location += f"<br>GPS: {asset['latitude']:.6f}, {asset['longitude']:.6f}"
-            blocks += ["<h4>Место съёмки · метаданные</h4>", f"<p>{location}</p>"]
+            source = html.escape(asset.get('geo_source') or 'Метаданные файла')
+            try:
+                approximate = json.loads(asset.get('geo_json') or '{}').get('place_names_are_approximate',False)
+            except (ValueError,TypeError):
+                approximate = False
+            if approximate:
+                location += '<br>Название подобрано по ближайшему городу; это приблизительный ориентир.'
+            blocks += ["<h4>Место съёмки · из файла</h4>", f"<p>{location}<br>Источник: {source}</p>"]
         if asset.get('user_place') or asset.get('user_latitude') is not None:
             location = html.escape(asset.get('user_place') or '')
             if asset.get('user_latitude') is not None:
@@ -1138,14 +1200,20 @@ class MainWindow(Workspace, QMainWindow):
         if index.isValid():
             asset = index.data(PhotoModel.AssetRole)
             if asset and asset.get('media_kind') == 'video':
-                from .video_player import VideoPlayerDialog
-                player = VideoPlayerDialog(asset, self.cfg, self, self.backend)
-                player.exec()
-                player.deleteLater()
+                self.open_video_moment(asset)
                 return
             viewer = Viewer(self.model, index.row(), self.cfg, self, self.backend)
             viewer.personSelected.connect(self.find_person)
             viewer.exec()
+
+    def open_video_moment(self, asset, moment=False):
+        from .video_player import VideoPlayerDialog
+        from .video import asset_at_moment
+        player = VideoPlayerDialog(asset_at_moment(asset,moment) if moment else asset, self.cfg, self, self.backend)
+        if moment is None:
+            QTimer.singleShot(0,player.more_moments)
+        player.exec()
+        player.deleteLater()
 
     def external_open(self):
         if self.selected_asset:
@@ -1271,8 +1339,14 @@ class MainWindow(Workspace, QMainWindow):
             self.cancel_button.setVisible(bool(self.conditions))
             self.page_total = event.get("page_total", self.total)
             restore = event.get('restore')
+            stack_change = self._stack_change if self._stack_change and self._stack_change['request_id'] == self.request_id else None
+            # Restoring a deep viewport with 100-row batches needs hundreds of
+            # event-loop turns. Larger bounded batches keep work per turn short
+            # while finishing the offscreen geometry without a long delay.
+            self.gallery.setBatchSize(1000 if restore and restore.get('loaded_count',0)>2000 else 100)
             self.model.reset_result(event["items"], self.page_total, event.get("has_more", False),
-                                    offset=event.get('offset', 0), loaded_count=restore.get('loaded_count', 0) if restore else 0)
+                                    offset=event.get('offset', 0), loaded_count=restore.get('loaded_count', 0) if restore else 0,
+                                    geometry_prefix=stack_change['geometry_prefix'] if stack_change else None)
             self.clear_details()
             if event["items"]:
                 self.gallery.setCurrentIndex(self.model.index(restore['selected_row'] if restore else 0))

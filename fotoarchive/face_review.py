@@ -11,12 +11,12 @@ from .face_widgets import FaceFilterPanel
 
 
 class FaceReviewDialog(QDialog):
-    def __init__(self, owner):
+    def __init__(self, owner, *, examples=None, rejected=None, skipped=None):
         super().__init__(owner)
         self.owner, self.backend = owner, owner.backend
-        self.examples = OrderedDict(owner.face_examples)
-        self.rejected = set(owner.face_rejected)
-        self.skipped = set(owner.face_skipped)
+        self.examples = OrderedDict(owner.face_examples if examples is None else examples)
+        self.rejected = set(owner.face_rejected if rejected is None else rejected)
+        self.skipped = set(owner.face_skipped if skipped is None else skipped)
         self.seen = set()
         self.faces = dict(self.examples)
         self.decisions = {}

@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QTransform
-from PySide6.QtWidgets import QWidget
+from PySide6.QtWidgets import QWidget, QToolTip
 
 
 class MapView(QWidget):
@@ -94,7 +94,8 @@ class MapView(QWidget):
             if not self.rect().adjusted(-15,-15,15,15).contains(at.toPoint()):
                 continue
             radius = 14 if point['count'] > 1 else 5
-            p.setBrush(QColor('#168f82'))
+            manual = point.get('manual_count',0)
+            p.setBrush(QColor('#78629e' if manual and manual<point['count'] else '#477bbb' if manual else '#168f82'))
             p.setPen(QPen(QColor('#ffffff'), 1))
             p.drawEllipse(at, radius, radius)
             if radius > 5:
@@ -123,6 +124,14 @@ class MapView(QWidget):
                 dy = max(-90-s, min(90-n, dy))
                 self.bounds = (w-dx,s+dy,e-dx,n+dy)
             self.update()
+        else:
+            nearest = min(self.points,key=lambda point:(self.pixel(point['longitude'],point['latitude'])-event.position()).manhattanLength(),default=None)
+            if nearest and (self.pixel(nearest['longitude'],nearest['latitude'])-event.position()).manhattanLength()<20:
+                QToolTip.showText(event.globalPosition().toPoint(),
+                    f"Материалов: {nearest['count']}\nКоординаты из файла: {nearest.get('metadata_count',nearest['count'])}\n"
+                    f"Координаты указаны вручную: {nearest.get('manual_count',0)}",self)
+            else:
+                QToolTip.hideText()
 
     def mouseReleaseEvent(self, event):
         if self.start:

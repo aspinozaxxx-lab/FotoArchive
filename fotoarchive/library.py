@@ -115,7 +115,8 @@ class Library:
             params += [s,n,w,e]
         # At most 2,592 grid cells. No full-coordinate array crosses into Qt.
         points = [dict(row) for row in self.db.execute(f'''SELECT avg({lat}) latitude,avg({lon}) longitude,
-            count(*) count,min(id) asset_id,CAST(({lat}+90)/{step} AS INTEGER)*{step}-90 south,
+            count(*) count,sum(user_latitude IS NOT NULL) manual_count,
+            sum(user_latitude IS NULL) metadata_count,min(id) asset_id,CAST(({lat}+90)/{step} AS INTEGER)*{step}-90 south,
             CAST(({lon}+180)/{step} AS INTEGER)*{step}-180 west FROM assets
             WHERE {where} AND {lat} IS NOT NULL AND {lon} IS NOT NULL
             GROUP BY CAST(({lat}+90)/{step} AS INTEGER),CAST(({lon}+180)/{step} AS INTEGER) LIMIT 4096''', params)]

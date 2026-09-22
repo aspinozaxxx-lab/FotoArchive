@@ -364,3 +364,13 @@ def test_named_person_new_example_is_used_immediately(qtbot,tmp_path):
     w.find_person('new')
     assert w.backend.sent[-1]['people'][0]['examples']==['old','new']
     w.close()
+
+
+def test_map_provenance_keeps_model_guesses_off_map(catalog):
+    with catalog.db:
+        catalog.db.execute('UPDATE assets SET latitude=55,longitude=37 WHERE id=1')
+        catalog.db.execute('UPDATE assets SET user_latitude=55,user_longitude=37 WHERE id=2')
+        catalog.db.execute("UPDATE assets SET description='Вероятно Москва' WHERE id=3")
+    points=Library(catalog).places(Filters())['points']
+    assert len(points)==1
+    assert points[0]['count']==2 and points[0]['manual_count']==1 and points[0]['metadata_count']==1

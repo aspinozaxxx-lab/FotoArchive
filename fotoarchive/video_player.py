@@ -3,9 +3,9 @@ from PySide6.QtCore import Qt, QUrl, QRectF, QTimer
 from PySide6.QtGui import QPainter, QColor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
-from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QListWidget, QListWidgetItem
+from PySide6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QSlider, QVBoxLayout, QListWidget, QListWidgetItem, QScrollArea, QWidget
 
-from .video import timestamp_text
+from .video import timestamp_text, asset_at_moment, search_coverage_text
 
 
 class MomentSlider(QSlider):
@@ -53,11 +53,17 @@ class VideoPlayerDialog(QDialog):
         controls.addWidget(frame)
         layout.addLayout(controls)
         if moments:
-            moments_row = QHBoxLayout()
+            scroller = QScrollArea()
+            scroller.setWidgetResizable(True)
+            scroller.setFixedHeight(66)
+            scroller.setFrameShape(QScrollArea.NoFrame)
+            row_widget = QWidget()
+            moments_row = QHBoxLayout(row_widget)
+            scroller.setWidget(row_widget)
             moments_row.addWidget(QLabel('Моменты:'))
             for moment in moments:
                 button = QPushButton(timestamp_text(moment['timestamp_ms']))
-                button.clicked.connect(lambda checked=False,t=moment['timestamp_ms']:self.player.setPosition(t))
+                button.clicked.connect(lambda checked=False,moment=moment:self.choose_moment(moment))
                 moments_row.addWidget(button)
             remaining = asset.get('moment_count',len(moments))-len(moments)
             if remaining>0:
@@ -65,8 +71,8 @@ class VideoPlayerDialog(QDialog):
                 more.clicked.connect(self.more_moments)
                 moments_row.addWidget(more)
             moments_row.addStretch()
-            layout.addLayout(moments_row)
-        self.message = QLabel('Поиск использует кадры через 10 секунд. Проверка условий относится к показанному кадру.')
+            layout.addWidget(scroller)
+        self.message = QLabel(search_coverage_text(asset))
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
         self.player.durationChanged.connect(lambda duration: self.slider.setRange(0, duration))
@@ -112,18 +118,23 @@ class VideoPlayerDialog(QDialog):
             timeout.stop()
             for row in event['items']:
                 item = QListWidgetItem(timestamp_text(row['timestamp_ms']))
-                item.setData(Qt.UserRole,row['timestamp_ms'])
+                item.setData(Qt.UserRole,row)
                 items.addItem(item)
             state['offset'] += len(event['items'])
             more.setEnabled(len(event['items'])==100)
             more.setText('Загрузить ещё' if len(event['items'])==100 else 'Все найденные моменты показаны')
-        items.itemClicked.connect(lambda item:self.player.setPosition(item.data(Qt.UserRole)))
+        items.itemClicked.connect(lambda item:self.choose_moment(item.data(Qt.UserRole)))
         more.clicked.connect(request)
         self.backend.event.connect(receive)
         request()
         dialog.exec()
         self.backend.event.disconnect(receive)
         dialog.deleteLater()
+
+    def choose_moment(self, moment):
+        self.asset = asset_at_moment(self.asset,moment)
+        self.pending_seek = moment['timestamp_ms'] if self.player.mediaStatus() != QMediaPlayer.LoadedMedia else None
+        self.player.setPosition(moment['timestamp_ms'])
 
     def position_changed(self, position):
         if not self.slider.isSliderDown():

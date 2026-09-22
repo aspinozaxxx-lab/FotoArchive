@@ -22,6 +22,8 @@ from PySide6.QtWidgets import QApplication
 from fotoarchive.ui import MainWindow
 
 base=Path(r'D:\FotoArchiveData\reports\v070-scale')
+report_dir=Path(os.environ.get('FOTOARCHIVE_BENCHMARK_REPORT',str(base)))
+report_dir.mkdir(parents=True,exist_ok=True)
 cfg=Settings(data_dir=base/'catalog',root=base/'synthetic',includes=['2000'])
 cfg.initialize()
 cfg.save()
@@ -214,17 +216,48 @@ for proportional in (0,1):
         scroll_times.append(time.perf_counter()-started)
 report['scroll_event_p95_seconds']=float(np.percentile(scroll_times,95))
 report['bounded_cache']={'pages':len(window.model.blocks),'images':len(window.model.cache),'image_tasks':len(window.model.requested)}
+# Real asynchronous stack requests deep in the catalogue, including variable
+# widths. A correct row ID alone is not enough: its screen position must stay.
+stack_timings=[]
+stack_errors=[]
+motion_gaps=[]
+for layout_mode in (0,1,2):
+    window.layout_combo.setCurrentIndex(layout_mode)
+    pump(lambda:window.gallery.visualRect(window.model.index(window.model.rowCount()-1)).isValid())
+    visible=[]
+    for offset,items in list(window.model.blocks.items()):
+        for i,asset in enumerate(items):
+            rect=window.gallery.visualRect(window.model.index(offset+i))
+            if asset.get('stack_count',0)>1 and 30<rect.top()<window.gallery.viewport().height()-80:
+                visible.append((offset+i,asset))
+    if not visible: raise AssertionError('No visible stack for animation benchmark')
+    row,asset=visible[0]
+    for _ in range(4):
+        before=window.gallery.visualRect(window.model.index(row)).y()
+        tick_start=len(ticks)
+        started=time.perf_counter()
+        window.toggle_stack(asset['stack_key'],row)
+        pump(lambda:not window.loading and window._stack_change is None)
+        restored=time.perf_counter()-started
+        pump(lambda:not window.gallery.stack_motion or not window.gallery.stack_motion.isVisible())
+        stack_timings.append(dict(layout=layout_mode,restore_seconds=restored,total_seconds=time.perf_counter()-started))
+        stack_errors.append(abs(window.gallery.visualRect(window.model.index(row)).y()-before))
+        motion_gaps.extend(ticks[tick_start:])
+report['stack_motion']=dict(samples=stack_timings,max_anchor_error_px=max(stack_errors),
+    restore_p95_seconds=float(np.percentile([s['restore_seconds'] for s in stack_timings],95)),
+    total_p95_seconds=float(np.percentile([s['total_seconds'] for s in stack_timings],95)),
+    event_loop_gap_p95_seconds=float(np.percentile(motion_gaps,95)),event_loop_gap_max_seconds=max(motion_gaps))
 window.layout_combo.setCurrentIndex(0)
 window.gallery.scrollToTop()
 window.search()
 pump(lambda:not window.loading)
 window.apply_theme('light')
-window.grab().save(str(base/'workspace-light.png'))
+window.grab().save(str(report_dir/'workspace-light.png'))
 window.apply_theme('dark')
-window.grab().save(str(base/'workspace-dark.png'))
+window.grab().save(str(report_dir/'workspace-dark.png'))
 window.map_toggle.setChecked(True)
 pump(lambda:bool(window.map_widget.points))
-window.grab().save(str(base/'workspace-map.png'))
+window.grab().save(str(report_dir/'workspace-map.png'))
 started=time.perf_counter()
 for i in range(100):
     window.media_combo.setCurrentIndex([1,2,0][i%3])
@@ -246,7 +279,8 @@ backend.reader.thread.join(5);backend.library.thread.join(5)
 report['passed']=(report['qt']['filter_paint_p95_seconds']<.3 and report['read']['warm_p95_seconds']<.3
     and report['last_request_won'] and report['rapid_last_switch_settle_seconds']<.3
     and report['deep_history_restored'] and report['scroll_event_p95_seconds']<.1
+    and report['stack_motion']['max_anchor_error_px']<=1 and report['stack_motion']['restore_p95_seconds']<.6
     and report['bounded_cache']['pages']<=8 and report['bounded_cache']['images']<=256)
-(base/'result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
+(report_dir/'result.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf-8')
 print(json.dumps(report,ensure_ascii=False,indent=2),flush=True)
 raise SystemExit(0 if report['passed'] else 1)

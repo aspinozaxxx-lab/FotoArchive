@@ -16,6 +16,24 @@ def timestamp_text(milliseconds):
     return f'{hours}:{minutes:02}:{seconds:02}' if hours else f'{minutes:02}:{seconds:02}'
 
 
+def asset_at_moment(asset, moment):
+    """Do not carry a different frame's caption or verdict into the viewer."""
+    result = dict(asset)
+    if moment.get('unit_id') != asset.get('unit_id'):
+        for key in ('description','observations_json','verification','face_score','face_match_id'):
+            result.pop(key,None)
+    result.update(unit_id=moment['unit_id'],timestamp_ms=moment['timestamp_ms'])
+    result['thumbnail'] = result['unit_thumbnail'] = moment.get('thumbnail','')
+    return result
+
+
+def search_coverage_text(asset):
+    from .config import EMBED_VERSION
+    state = ('Поисковая обработка ещё не завершена; доступны готовые кадры. '
+             if asset.get('embed_version') != EMBED_VERSION else '')
+    return state+f'Поиск по кадрам через {VIDEO_INTERVAL_MS//1000} секунд; короткие события между ними могут быть пропущены. Проверка условий относится к отдельному кадру.'
+
+
 def _stream(container):
     stream = next((s for s in container.streams.video if not (s.disposition & s.disposition.attached_pic)), None)
     if stream is None:

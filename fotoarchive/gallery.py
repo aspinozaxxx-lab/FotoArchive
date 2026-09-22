@@ -45,13 +45,14 @@ class PhotoModel(QAbstractListModel):
     def set_items(self, items):
         self.reset_result(items, len(items), False)
 
-    def reset_result(self, items, total, has_more, offset=0, loaded_count=0):
+    def reset_result(self, items, total, has_more, offset=0, loaded_count=0, geometry_prefix=None):
         self.pool.clear()
         self.requested.clear()
         self.failed.clear()
         self.beginResetModel()
         self.blocks.clear()
-        self.geometry.clear()
+        self.geometry = {row: size for row, size in self.geometry.items()
+                         if geometry_prefix is not None and row < geometry_prefix}
         self.hover_thumbnail = None
         self.pending.clear()
         self.count = min(total, max(offset + len(items), loaded_count))
@@ -144,7 +145,14 @@ class PhotoModel(QAbstractListModel):
             except ValueError:
                 date = 'Дата неизвестна'
             stack = f"\nВ стопке совпало: {asset['stack_count']} из {asset.get('stack_total',asset['stack_count'])}. Нажмите число, чтобы раскрыть." if asset.get('stack_count',0)>1 else ''
-            return asset.get('filename','') + '\n' + date + '\n' + asset.get('relative_path','') + stack
+            video = ''
+            if asset.get('media_kind') == 'video':
+                from .video import timestamp_text, search_coverage_text
+                moments = asset.get('matched_moments',[])
+                if moments:
+                    video = '\nНайденные моменты: '+', '.join(timestamp_text(m['timestamp_ms']) for m in moments[:4])+' · нажмите время на карточке'
+                video += '\n'+search_coverage_text(asset)
+            return asset.get('filename','') + '\n' + date + '\n' + asset.get('relative_path','') + stack + video
         if role == self.PixmapRole:
             key = str(asset.get("thumbnail") or "")
             if self.hover_thumbnail and self.hover_thumbnail[0] == asset['id']:

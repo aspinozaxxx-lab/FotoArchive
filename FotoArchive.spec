@@ -2,6 +2,7 @@
 from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_all
 from pathlib import Path
+import os
 
 datas = [('fotoarchive/assets', 'fotoarchive/assets')]
 binaries = []
@@ -62,7 +63,8 @@ exe = EXE(
     entitlements_file=None,
     icon=['fotoarchive/assets/FotoArchive.ico'],
 )
-coll = COLLECT(
+if os.environ.get('FOTOARCHIVE_EXE_ONLY') != '1':
+    coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
@@ -70,4 +72,4 @@ coll = COLLECT(
     upx=True,
     upx_exclude=[],
     name='FotoArchive',
-)
+    )

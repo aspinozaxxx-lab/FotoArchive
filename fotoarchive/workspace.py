@@ -27,6 +27,7 @@ class Workspace:
         self._view_state = None
         self._restoring_controls = True
         self._pending_anchor = None
+        self._stack_change = None
         self.navigation_serial = 0
         self.map_serial = 0
         self._folder_signature = None
@@ -131,6 +132,7 @@ class Workspace:
         self.gallery.zoomRequested.connect(lambda delta:self.thumbnail_size.setValue(self.thumbnail_size.value()+delta))
         self.gallery.hoverVideo.connect(lambda asset:self.backend.send(action='library_storyboard',asset_id=asset['id'],version=asset['version']))
         self.delegate.stackToggled.connect(self.toggle_stack)
+        self.delegate.momentOpened.connect(self.open_video_moment)
         self.gallery.verticalScrollBar().valueChanged.connect(self.workspace_scrolled)
         self.model.assetsReady.connect(lambda *_:self.update_month_header())
         self.face_save_button = QPushButton('Сохранить человека…')
@@ -419,35 +421,51 @@ class Workspace:
         entries = []
         filters = self.filters()
         if filters['folder']:
-            entries.append((filters['folder'],lambda:self.folder_combo.setCurrentIndex(0)))
+            entries.append((filters['folder'],lambda:self.folder_combo.setCurrentIndex(0),lambda:self.focus_filter(self.folder_find,0)))
         if filters['media_kind']:
-            entries.append(({'photo':'Фото','video':'Видео'}[filters['media_kind']],lambda:self.media_combo.setCurrentIndex(0)))
+            entries.append(({'photo':'Фото','video':'Видео'}[filters['media_kind']],lambda:self.media_combo.setCurrentIndex(0),self.edit_media_filter))
         if filters['date_from']:
-            entries.append((f"{filters['date_from']} — {filters['date_to']}",lambda:self.date_enabled.setChecked(False)))
+            entries.append((f"{filters['date_from']} — {filters['date_to']}",lambda:self.date_enabled.setChecked(False),lambda:self.focus_filter(self.date_from)))
         if filters['unknown_date']:
-            entries.append(('Без даты',lambda:self.unknown.setChecked(False)))
+            entries.append(('Без даты',lambda:self.unknown.setChecked(False),lambda:self.focus_filter(self.unknown)))
         for key,combo in [('extension',self.format_combo),('camera',self.camera_combo)]:
             if filters[key]:
-                entries.append((filters[key],lambda combo=combo:combo.setCurrentIndex(0)))
+                entries.append((filters[key],lambda combo=combo:combo.setCurrentIndex(0),lambda combo=combo:self.focus_filter(combo)))
         if filters.get('place'):
-            entries.append((filters['place'],lambda:(self.place_query.clear(),self.search())))
+            entries.append((filters['place'],lambda:(self.place_query.clear(),self.search()),lambda:self.focus_filter(self.place_query,2)))
         if filters.get('geo_bounds'):
-            entries.append(('Область карты',lambda:self.select_map_bounds('')))
+            entries.append(('Область карты',lambda:self.select_map_bounds(''),lambda:self.map_toggle.setChecked(True)))
         if filters.get('has_gps'):
-            entries.append(('С координатами',lambda:self.gps_check.setChecked(False)))
+            entries.append(('С координатами',lambda:self.gps_check.setChecked(False),lambda:self.focus_filter(self.gps_check,2)))
         if self.selected_people and self.reference and self.reference[0]=='face_search':
             for person in self.selected_people:
-                entries.append((person['name'],lambda key=person['id']:self.remove_person_filter(key)))
+                entries.append((person['name'],lambda key=person['id']:self.remove_person_filter(key),lambda key=person['id']:self.edit_person_filter(key)))
         elif self.reference and self.reference[0] == 'face_search':
-            entries.append(('Человек',self.clear_person))
+            entries.append(('Человек',self.clear_person,self.refine_person))
         if self.reference and self.reference[0] == 'similar':
-            entries.append(('Похожие кадры',self.clear_query))
-        for title,callback in entries:
-            button = QPushButton(title+'  ×')
-            button.setMaximumWidth(230)
-            button.setToolTip(title+' — нажмите, чтобы снять')
-            button.clicked.connect(callback)
-            self.chips_layout.addWidget(button)
+            entries.append(('Похожие кадры',self.clear_query,lambda:self.focus_filter(self.search_box)))
+        if self.search_box.text().strip() and not self.reference:
+            entries.append((self.search_box.text().strip(),self.clear_query,lambda:self.search_box.setFocus()))
+        self._filter_entries = entries
+        for title,remove,edit in entries:
+            chip = QWidget()
+            row = QHBoxLayout(chip)
+            row.setContentsMargins(0,0,0,0)
+            row.setSpacing(1)
+            button = QPushButton(title)
+            button.setMaximumWidth(205)
+            button.setToolTip(title+' — изменить фильтр')
+            button.setAccessibleName('Изменить фильтр: '+title)
+            button.clicked.connect(edit)
+            row.addWidget(button)
+            close = QPushButton('×')
+            close.setFixedWidth(28)
+            close.setStyleSheet('padding: 7px 0;')
+            close.setToolTip('Снять фильтр: '+title)
+            close.setAccessibleName('Снять фильтр: '+title)
+            close.clicked.connect(remove)
+            row.addWidget(close)
+            self.chips_layout.addWidget(chip)
         if entries:
             clear = QPushButton('Сбросить всё')
             clear.clicked.connect(self.reset_all_filters)
@@ -458,6 +476,46 @@ class Workspace:
         self.breadcrumbs.setText(folder.replace('/','  ›  ')+('  · с подпапками' if filters.get('folder') and filters['include_subfolders'] else ''))
         for key,button in self.media_buttons.items():
             button.setChecked(key == filters['media_kind'])
+
+    def focus_filter(self, widget, tab=None):
+        if widget is not self.search_box:
+            self.sidebar_toggle.setChecked(True)
+        if tab is not None:
+            self.navigation_tabs.setCurrentIndex(tab)
+        widget.setFocus(Qt.ShortcutFocusReason)
+        if isinstance(widget,QLineEdit):
+            widget.selectAll()
+        if isinstance(widget,QComboBox):
+            widget.showPopup()
+
+    def edit_media_filter(self):
+        menu = QMenu(self)
+        for title,key in [('Все',''),('Фото','photo'),('Видео','video')]:
+            menu.addAction(title,lambda key=key:self.media_combo.setCurrentIndex(self.media_combo.findData(key)))
+        menu.exec(self.chips_panel.mapToGlobal(QPoint(0,self.chips_panel.height())))
+
+    def edit_person_filter(self, key):
+        from .face_review import FaceReviewDialog
+        person = next((p for p in self.selected_people if p['id']==key),None)
+        if not person:
+            return
+        examples = OrderedDict((key,self.face_cache.get(key,{'id':key})) for key in person['examples'])
+        dialog = FaceReviewDialog(self,examples=examples,rejected=person['rejected'],skipped=[])
+        dialog.setWindowTitle('Уточнить фильтр: '+person['name'])
+        if dialog.exec() == QDialog.Accepted:
+            if not dialog.examples:
+                self.remove_person_filter(key)
+            else:
+                updated = person | dict(examples=list(dialog.examples),rejected=sorted(dialog.rejected))
+                self.selected_people = [updated if p['id']==key else p for p in self.selected_people]
+                self.face_cache.update(dialog.examples)
+                self.face_examples = OrderedDict((face,self.face_cache.get(face,{'id':face}))
+                    for p in self.selected_people for face in p['examples'])
+                self.face_rejected = set(updated['rejected']) if len(self.selected_people)==1 else set()
+                self.backend.send(action='library_save_person',person_id=key,name=person['name'],
+                    examples=updated['examples'],rejected=updated['rejected'],cover=person.get('cover'))
+                self.activate_person_search()
+        dialog.deleteLater()
 
     def reset_all_filters(self):
         self.selected_people = []
@@ -477,6 +535,7 @@ class Workspace:
         self.gallery.stop_scroll()
         self.delegate.edge = self.thumbnail_size.value()
         self.delegate.proportions = self.layout_combo.currentIndex()==1
+        self.delegate.full_frame = self.layout_combo.currentIndex()==2
         self.gallery.setUniformItemSizes(not self.delegate.proportions)
         self.gallery.doItemsLayout()
         if anchor:
@@ -513,7 +572,20 @@ class Workspace:
             self.expanded_stacks.clear()
             self.search(preserve_position=True)
 
-    def toggle_stack(self,key):
+    def toggle_stack(self,key, row=None):
+        # Anchor the clicked cover itself, including when it is below the first
+        # visible row. Only the geometry before this stack can be reused.
+        candidates = [(offset+i, asset) for offset, items in self.model.blocks.items()
+                      for i, asset in enumerate(items) if asset.get('stack_key') == key]
+        if candidates:
+            first, _ = min(candidates, key=lambda pair: pair[0])
+            row, asset = next((pair for pair in candidates if pair[0] == row),
+                              min(candidates, key=lambda pair: pair[0]))
+            rect = self.gallery.visualRect(self.model.index(row))
+            self._pending_anchor = dict(asset_id=asset['id'], row=row, selected_id=asset['id'],
+                                        offset_y=rect.y(), loaded_count=self.model.rowCount())
+            self._stack_change = dict(request_id=self.request_id+1, geometry_prefix=first)
+            self.gallery.begin_stack_transition(key, rect)
         if key in self.expanded_stacks:
             self.expanded_stacks.remove(key)
         else:
@@ -533,6 +605,12 @@ class Workspace:
         menu = QMenu(self)
         menu.addAction('Открыть',lambda:self.view_photo(index))
         menu.addAction('Найти похожие',self.similar)
+        if asset.get('matched_moments'):
+            from .video import timestamp_text
+            moments = menu.addMenu('Найденные моменты')
+            for moment in asset['matched_moments'][:12]:
+                moments.addAction(timestamp_text(moment['timestamp_ms']),lambda moment=moment:self.open_video_moment(asset,moment))
+            moments.addAction('Все найденные моменты…',lambda:self.open_video_moment(asset,None))
         if asset.get('stack_count',0)>1:
             menu.addAction('Свернуть стопку' if asset.get('stack_expanded') else 'Развернуть стопку',lambda:self.toggle_stack(asset['stack_key']))
             menu.addAction('Сделать обложкой стопки',lambda:self.backend.send(action='library_stack_cover',stack_key=asset['stack_key'],asset_id=asset['id']))
@@ -651,7 +729,7 @@ class Workspace:
         elif kind in ('library_save_person','library_merge_people','library_delete_person','library_split_person'):
             self.refresh_people(event['people'])
             if kind == 'library_save_person':
-                self.current_person_id = event['person_id']
+                self.current_person_id = event['person_id'] if len(self.selected_people)<=1 else None
             self.message.setText('Каталог людей сохранён')
         elif kind in ('library_set_place','library_stack_cover','library_unstack'):
             self.search(preserve_position=True)
