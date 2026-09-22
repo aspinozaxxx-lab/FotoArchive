@@ -21,7 +21,7 @@ map.on('load',()=>{map.addSource('photos',{type:'geojson',data:{type:'FeatureCol
   map.addLayer({id:'photo-points',type:'circle',source:'photos',paint:{'circle-radius':['case',['>', ['get','count'],1],14,6],
     'circle-color':['case',['all',['>', ['coalesce',['get','manual_count'],0],0],['>', ['coalesce',['get','metadata_count'],0],0]],'#826bb0',['>', ['coalesce',['get','manual_count'],0],0],'#477bbb','#159e8f'],'circle-stroke-width':1.5,'circle-stroke-color':'#fff'}});
   map.addLayer({id:'photo-counts',type:'symbol',source:'photos',filter:['>', ['get','count'],1],layout:{'text-field':['get','label'],'text-font':['Noto Sans Medium'],'text-size':12,'text-allow-overlap':true},paint:{'text-color':'#fff'}});
-  ready=true;fotoMap.points(pendingPoints);const saved=new URLSearchParams(location.search).get('view');if(saved){const v=JSON.parse(saved);map.jumpTo({center:v.slice(0,2),zoom:v[2]});}else fotoMap.fit([34.8,54.0,40.6,57.3]);viewChanged();if(bridge)bridge.loaded();
+  ready=true;fotoMap.points(pendingPoints);const saved=new URLSearchParams(location.search).get('view');if(saved){const v=JSON.parse(saved);map.jumpTo({center:v.slice(0,2),zoom:v[2]});}else map.jumpTo({center:[37.7,55.65],zoom:7});viewChanged();if(bridge)bridge.loaded();
 });
 map.on('moveend',viewChanged);
 map.on('click','photo-points',e=>{if(selectionStart)return;let p=pendingPoints[e.features[0].properties.index];if(bridge&&p)bridge.selected(JSON.stringify([p.west??p.longitude-.002,p.south??p.latitude-.002,p.east??p.longitude+.002,p.north??p.latitude+.002]));});
