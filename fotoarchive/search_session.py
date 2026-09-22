@@ -1,4 +1,4 @@
-"""A disk-backed search session: only one gallery page and 40 checks enter memory."""
+"""Disk-backed results; paged records plus lightweight dimensions for Qt layout."""
 from __future__ import annotations
 
 import json
@@ -124,7 +124,32 @@ class SearchSession:
 
     def restore_position(self, anchor):
         if self.presentation:
-            return self.presentation.restore(anchor)
+            result = self.presentation.restore(anchor)
+        else:
+            result = self._restore_flat_position(anchor)
+        # A restored view exposes rows whose records are no longer cached.
+        # Their real aspect ratios must be known before Qt lays them out, or
+        # loading a distant page silently leaves guessed cell widths behind.
+        count = max(result['loaded_count'], (result['row']//self.PAGE_SIZE+1)*self.PAGE_SIZE)
+        result['layout_geometry'] = self.layout_geometry(count)
+        return result
+
+    def layout_geometry(self, count, verdict=''):
+        if self.presentation:
+            self.presentation.build(verdict)
+            kind = self.presentation.media_kind
+            where,params = ('WHERE d.media_kind=?',[kind]) if kind else ('',[])
+            rows = self.catalog.db.execute('SELECT d.width,d.height FROM display_rows d '
+                +where+' ORDER BY d.position LIMIT ?',params+[count])
+        else:
+            where,params = ('s.verdict IS NULL',[]) if verdict=='pending' else ('s.verdict=?',[verdict]) if verdict else ('1',[])
+            rows = self.catalog.db.execute('''SELECT a.width,a.height FROM active_search s
+                CROSS JOIN assets a ON a.id=s.asset_id WHERE a.present=1 AND s.file_version=a.version
+                AND '''+where+' ORDER BY s.ordinal LIMIT ?',params+[count])
+        # Dimensions only, no paths, captions, images or full catalogue records.
+        return [(row[0] or 4,row[1] or 3) for row in rows]
+
+    def _restore_flat_position(self, anchor):
         def position(asset_id):
             row = self.catalog.db.execute('SELECT ordinal FROM active_search WHERE asset_id=?', (asset_id,)).fetchone()
             return row[0] if row else None

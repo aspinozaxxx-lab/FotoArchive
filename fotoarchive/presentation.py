@@ -96,7 +96,8 @@ class Presentation:
         self.dirty = True
         self.db.executescript('''DROP TABLE IF EXISTS temp.display_rows;
             CREATE TEMP TABLE display_rows(position INTEGER PRIMARY KEY,asset_id INTEGER UNIQUE,
-              stack_key TEXT,stack_count INTEGER,stack_total INTEGER,stack_expanded INTEGER,media_kind TEXT);
+              stack_key TEXT,stack_count INTEGER,stack_total INTEGER,stack_expanded INTEGER,media_kind TEXT,
+              width INTEGER,height INTEGER);
             CREATE INDEX display_media ON display_rows(media_kind,position);
             DROP TABLE IF EXISTS temp.expanded_stacks;
             CREATE TEMP TABLE expanded_stacks(key TEXT PRIMARY KEY);''')
@@ -113,11 +114,11 @@ class Presentation:
               CREATE TEMP TABLE stack_totals AS SELECT stack_key,count(*) total FROM stack_map GROUP BY stack_key;
               CREATE UNIQUE INDEX stack_totals_key ON stack_totals(stack_key);
               CREATE TEMP TABLE grouped_matches(asset_id INTEGER PRIMARY KEY,ordinal INTEGER,key TEXT,
-                first INTEGER,n INTEGER,choice INTEGER,total INTEGER,media_kind TEXT);
+                first INTEGER,n INTEGER,choice INTEGER,total INTEGER,media_kind TEXT,width INTEGER,height INTEGER);
               ''')
             self.db.execute('''INSERT INTO grouped_matches
           WITH candidates AS MATERIALIZED (
-            SELECT s.asset_id,s.ordinal,a.media_kind,coalesce(m.stack_key,'a:'||s.asset_id) key,
+            SELECT s.asset_id,s.ordinal,a.media_kind,a.width,a.height,coalesce(m.stack_key,'a:'||s.asset_id) key,
               CASE WHEN c.asset_id=s.asset_id THEN 0 ELSE 1 END cover
             FROM active_search s JOIN assets a ON a.id=s.asset_id
             LEFT JOIN stack_map m ON m.asset_id=s.asset_id
@@ -127,7 +128,7 @@ class Presentation:
             FROM candidates GROUP BY key)
           SELECT c.asset_id,c.ordinal,c.key,g.first,g.n,
             CASE WHEN c.ordinal=coalesce(g.cover_ordinal,g.first) THEN 1 ELSE c.ordinal+2 END,
-            max(g.n,coalesce(t.total,g.n)),c.media_kind
+            max(g.n,coalesce(t.total,g.n)),c.media_kind,c.width,c.height
           FROM candidates c JOIN grouped g ON g.key=c.key LEFT JOIN stack_totals t ON t.stack_key=c.key''', params)
             self.db.executescript('CREATE INDEX grouped_cover ON grouped_matches(choice,first); CREATE INDEX grouped_key ON grouped_matches(key,choice);')
             self.matches_signature = matches_signature
@@ -135,10 +136,14 @@ class Presentation:
           WITH visible AS (SELECT * FROM grouped_matches WHERE choice=1
             UNION ALL SELECT g.* FROM expanded_stacks e JOIN grouped_matches g ON g.key=e.key WHERE g.choice>1)
           SELECT row_number() OVER (ORDER BY first,choice)-1,asset_id,key,n,total,
-            key IN (SELECT key FROM expanded_stacks),media_kind FROM visible''')
+            key IN (SELECT key FROM expanded_stacks),media_kind,width,height FROM visible''')
         self.media_totals = {row[0]:row[1] for row in self.db.execute('SELECT media_kind,count(*) FROM display_rows GROUP BY media_kind')}
         self.media_totals[''] = sum(self.media_totals.values())
         self.total = self.media_totals.get(self.media_kind,0)
+        # The completed view can be reused after a later SELECT is cancelled.
+        # Commit its temporary rows before marking it clean: reader rollback
+        # must never erase a cached display table while leaving its signature.
+        self.db.commit()
         self.signature = signature
         self.dirty = False
 

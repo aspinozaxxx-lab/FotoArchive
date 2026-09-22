@@ -489,8 +489,11 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
                             if not checking:
                                 emit({"type": "verification_done", "id": request_id, "checked": 0, "exhausted": True})
                     elif action == "search_page" and context and request_id == context.request_id:
-                        emit({"type": "search_page", "id": request_id, "view": command.get("view", 0),
-                            **context.page(command.get("offset", 0), command.get("verdict", ""), expand=True), **context.counts()})
+                        event = {"type": "search_page", "id": request_id, "view": command.get("view", 0),
+                            **context.page(command.get("offset", 0), command.get("verdict", ""), expand=True), **context.counts()}
+                        if command.get('layout_until'):
+                            event['layout_geometry'] = context.layout_geometry(command['layout_until'],command.get('verdict',''))
+                        emit(event)
                     elif action == 'search_places' and context and request_id == context.request_id:
                         from .library import Library
                         payload = Library(context.catalog).places(context.filters,command.get('viewport',''),command.get('step',5),

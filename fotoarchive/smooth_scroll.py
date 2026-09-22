@@ -2,7 +2,7 @@
 from math import exp
 from time import perf_counter
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QSignalBlocker
 from PySide6.QtWidgets import QListView
 
 
@@ -18,6 +18,7 @@ class PhotoGallery(QListView):
         self._direction = 0
         self._boost = 1.0
         self._setting_scroll = False
+        self._append_range_floor = None
         self._animation = QTimer(self)
         self._animation.setTimerType(Qt.PreciseTimer)
         self._animation.setInterval(16)
@@ -32,10 +33,39 @@ class PhotoGallery(QListView):
         self.stop_scroll()
         previous = self.model()
         if previous is not None:
-            previous.modelAboutToBeReset.disconnect(self.stop_scroll)
+            previous.modelAboutToBeReset.disconnect(self._reset_scroll)
+            previous.rowsAboutToBeInserted.disconnect(self._rows_appending)
         super().setModel(model)
         if model is not None:
-            model.modelAboutToBeReset.connect(self.stop_scroll)
+            model.modelAboutToBeReset.connect(self._reset_scroll)
+            model.rowsAboutToBeInserted.connect(self._rows_appending)
+
+    def _reset_scroll(self):
+        self._append_range_floor = None
+        self.stop_scroll()
+
+    def _rows_appending(self, parent, first, last):
+        if not parent.isValid() and first == self.model().rowCount() and first:
+            self._append_range_floor = self.verticalScrollBar().maximum()
+
+    def updateGeometries(self):
+        floor = getattr(self, '_append_range_floor', None)
+        if floor is None:
+            return super().updateGeometries()
+        # QListView restarts its batched layout when rows are appended. Its
+        # first batch temporarily shrinks the scroll range, clamping a deep
+        # viewport to the beginning. Keep the previous range until the layout
+        # catches up, without exposing the temporary clamp to the view/user.
+        bar = self.verticalScrollBar()
+        minimum, maximum, value = bar.minimum(), bar.maximum(), bar.value()
+        with QSignalBlocker(bar):
+            super().updateGeometries()
+            new_minimum, new_maximum = bar.minimum(), bar.maximum()
+            bar.setRange(minimum, maximum)
+            bar.setValue(value)
+        if new_maximum >= floor:
+            self._append_range_floor = None
+        bar.setRange(new_minimum, max(floor, new_maximum))
 
     def stop_scroll(self):
         self._animation.stop()

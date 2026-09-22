@@ -23,6 +23,7 @@ class PhotoModel(QAbstractListModel):
     pageRequested = Signal(int)
     assetsReady = Signal(int, int)
     countChanged = Signal()
+    visualsReady = Signal()
     PAGE_SIZE = 200
     MAX_PAGES = 8
 
@@ -45,7 +46,7 @@ class PhotoModel(QAbstractListModel):
     def set_items(self, items):
         self.reset_result(items, len(items), False)
 
-    def reset_result(self, items, total, has_more, offset=0, loaded_count=0, geometry_prefix=None):
+    def reset_result(self, items, total, has_more, offset=0, loaded_count=0, geometry_prefix=None, layout_geometry=None):
         self.pool.clear()
         self.requested.clear()
         self.failed.clear()
@@ -53,6 +54,8 @@ class PhotoModel(QAbstractListModel):
         self.blocks.clear()
         self.geometry = {row: size for row, size in self.geometry.items()
                          if geometry_prefix is not None and row < geometry_prefix}
+        if layout_geometry is not None:
+            self.geometry = dict(enumerate(layout_geometry))
         self.hover_thumbnail = None
         self.pending.clear()
         self.count = min(total, max(offset + len(items), loaded_count))
@@ -80,21 +83,27 @@ class PhotoModel(QAbstractListModel):
         if self.canFetchMore(parent):
             self.request_page(self.count)
 
-    def accept_page(self, offset, items, total, has_more):
+    def accept_page(self, offset, items, total, has_more, layout_geometry=None):
         self.pending.discard(offset)
         self.known_total, self.has_more = total, has_more
         new_count = max(self.count, offset + len(items))
+        if layout_geometry is not None:
+            self.geometry.update(enumerate(layout_geometry))
+        # RowsInserted can synchronously ask the delegate for cell sizes. Make
+        # dimensions and records available before publishing the new row count.
+        self.blocks[offset] = items
+        self.geometry.update((offset+i,(a.get('width',4),a.get('height',3))) for i,a in enumerate(items))
         if new_count > self.count:
             self.beginInsertRows(QModelIndex(), self.count, new_count - 1)
             self.count = new_count
             self.endInsertRows()
-        self.blocks[offset] = items
-        self.geometry.update((offset+i,(a.get('width',4),a.get('height',3))) for i,a in enumerate(items))
         self.blocks.move_to_end(offset)
         while len(self.blocks) > self.MAX_PAGES:
             self.blocks.popitem(last=False)
         if items:
-            self.dataChanged.emit(self.index(offset), self.index(offset + len(items) - 1))
+            # Geometry was supplied before insertion/restoration. Record arrival
+            # needs a repaint, not another batched layout of the entire prefix.
+            self.visualsReady.emit()
             self.assetsReady.emit(offset, offset + len(items) - 1)
         self.countChanged.emit()
 
@@ -129,7 +138,10 @@ class PhotoModel(QAbstractListModel):
         return self.blocks[offset][position] if position < len(self.blocks[offset]) else None
 
     def data(self, index, role=Qt.DisplayRole):
-        if not index.isValid():
+        # Layout/font/alignment probes cover offscreen rows too. They must not
+        # fetch records for roles this model does not provide, or deep views
+        # continuously evict the very page the user is looking at.
+        if not index.isValid() or role not in (Qt.DisplayRole,Qt.ToolTipRole,self.AssetRole,self.PixmapRole):
             return None
         asset = self.asset(index.row())
         if not asset:
@@ -176,6 +188,6 @@ class PhotoModel(QAbstractListModel):
             self.failed[key] = True
             while len(self.failed)>256:
                 self.failed.popitem(last=False)
-        # Only visible cells repaint; this also wakes slots whose thumbnail request was throttled.
-        if self.count:
-            self.dataChanged.emit(self.index(0), self.index(self.count - 1), [self.PixmapRole])
+        # Pixels changed, not item sizes or records. A full-range dataChanged
+        # makes QListView reconsider thousands of cells for each decoded image.
+        self.visualsReady.emit()

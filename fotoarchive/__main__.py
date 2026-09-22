@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--media-smoke-test", action="store_true")
     parser.add_argument('--browse-benchmark', action='store_true', help='Measure catalogue reads without opening or changing the library')
-    parser.add_argument('--ui-smoke-test', action='store_true', help='Check the packaged Qt gallery with generated records, without a catalogue or GPU')
+    parser.add_argument('--ui-smoke-test', action='store_true', help='Check the packaged Qt gallery and reader with generated records, without a real catalogue or GPU')
     parser.add_argument("--analyze-orientation", action="store_true", help="Start/resume recommendations for the already indexed photos")
     args = parser.parse_args()
     if args.ui_smoke_test:

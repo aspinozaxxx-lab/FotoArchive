@@ -212,6 +212,8 @@ class BrowseReader:
                         catalog.db.set_progress_handler(lambda: int(self.obsolete(generation)), 1000)
                         event = dict(type='search_page', id=command['id'], view=command.get('view', 0),
                             **session.page(command.get('offset', 0)), **session.counts())
+                        if command.get('layout_until'):
+                            event['layout_geometry'] = session.layout_geometry(command['layout_until'])
                     event['read_seconds'] = time.perf_counter() - started
                     if not self.obsolete(generation):
                         self.emit(event)

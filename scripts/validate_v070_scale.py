@@ -233,7 +233,7 @@ for layout_mode in (0,1,2):
     if not visible: raise AssertionError('No visible stack for animation benchmark')
     row,asset=visible[0]
     for _ in range(4):
-        before=window.gallery.visualRect(window.model.index(row)).y()
+        before=window.gallery.visualRect(window.model.index(row)).topLeft()
         tick_start=len(ticks)
         started=time.perf_counter()
         window.toggle_stack(asset['stack_key'],row)
@@ -241,7 +241,8 @@ for layout_mode in (0,1,2):
         restored=time.perf_counter()-started
         pump(lambda:not window.gallery.stack_motion or not window.gallery.stack_motion.isVisible())
         stack_timings.append(dict(layout=layout_mode,restore_seconds=restored,total_seconds=time.perf_counter()-started))
-        stack_errors.append(abs(window.gallery.visualRect(window.model.index(row)).y()-before))
+        after=window.gallery.visualRect(window.model.index(row)).topLeft()
+        stack_errors.append(max(abs(after.x()-before.x()),abs(after.y()-before.y())))
         motion_gaps.extend(ticks[tick_start:])
 report['stack_motion']=dict(samples=stack_timings,max_anchor_error_px=max(stack_errors),
     restore_p95_seconds=float(np.percentile([s['restore_seconds'] for s in stack_timings],95)),

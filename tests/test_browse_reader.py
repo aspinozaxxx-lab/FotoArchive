@@ -109,6 +109,42 @@ def test_reader_waits_for_schema_and_replacement_keeps_only_last_request(tmp_pat
         stop(reader)
 
 
+def test_cancelled_page_keeps_completed_stack_view(tmp_path, monkeypatch):
+    writer = sample_catalog(tmp_path, 900)
+    entered = Event()
+    original_page = SearchSession.page
+
+    def slow_page(session, offset=None, *args, **kwargs):
+        if session.request_id == 1 and offset == 200:
+            entered.set()
+            session.catalog.db.execute('''WITH RECURSIVE numbers(x) AS
+                (SELECT 1 UNION ALL SELECT x+1 FROM numbers WHERE x<1000000000)
+                SELECT sum(x) FROM numbers''').fetchone()
+        return original_page(session, offset, *args, **kwargs)
+
+    monkeypatch.setattr(SearchSession, 'page', slow_page)
+    events = queue.Queue()
+    reader = BrowseReader(writer.cfg, events.put)
+    command = dict(action='browse', id=1, filters={}, presentation={'stacks':True,'seconds':2})
+    try:
+        reader.enable()
+        reader.replace(command)
+        first = events.get(timeout=5)
+        assert len(first['items']) == 200
+        reader.page(dict(action='search_page', id=1, offset=200, view=0))
+        assert entered.wait(3)
+        reader.replace(command | {'id':2})
+        restored = events.get(timeout=5)
+        assert restored['type'] == 'results' and restored['cached']
+        assert [a['id'] for a in restored['items']] == [a['id'] for a in first['items']]
+        reader.page(dict(action='search_page', id=2, offset=200, view=0))
+        deep = events.get(timeout=5)
+        assert len(deep['items']) == 101 and deep['page_total'] == 301
+    finally:
+        stop(reader)
+        writer.close()
+
+
 def test_read_connection_cannot_modify_catalogue(tmp_path):
     writer = sample_catalog(tmp_path, 3)
     reader = Catalog.open_reader(writer.cfg)

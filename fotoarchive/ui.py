@@ -740,6 +740,7 @@ class MainWindow(Workspace, QMainWindow):
         self.model.pageRequested.connect(self.request_page)
         self.model.countChanged.connect(self.show_items)
         self.model.assetsReady.connect(self.assets_ready)
+        self.model.visualsReady.connect(self.gallery.viewport().update)
         self.gallery.verticalScrollBar().valueChanged.connect(self.scroll_more)
         self.delegate = PhotoDelegate(self.gallery)
         self.gallery.setItemDelegate(self.delegate)
@@ -965,7 +966,8 @@ class MainWindow(Workspace, QMainWindow):
             self.model.pending.discard(offset)
             return
         self.backend.send(action="search_page", id=self.request_id, view=self.view_id, offset=offset,
-                          verdict=self.verdict_combo.currentData() if self.conditions else "")
+                          verdict=self.verdict_combo.currentData() if self.conditions else "",
+                          **({'layout_until':offset+self.model.PAGE_SIZE} if offset>self.model.rowCount() else {}))
 
     def scroll_more(self):
         bar = self.gallery.verticalScrollBar()
@@ -981,7 +983,8 @@ class MainWindow(Workspace, QMainWindow):
 
     def apply_search_page(self, page):
         self.page_total = page["page_total"]
-        self.model.accept_page(page["offset"], page["items"], self.page_total, page.get("has_more", False))
+        self.model.accept_page(page["offset"], page["items"], self.page_total, page.get("has_more", False),
+                               layout_geometry=page.get('layout_geometry'))
 
     def similar(self):
         if self.selected_asset:
@@ -1346,7 +1349,8 @@ class MainWindow(Workspace, QMainWindow):
             self.gallery.setBatchSize(1000 if restore and restore.get('loaded_count',0)>2000 else 100)
             self.model.reset_result(event["items"], self.page_total, event.get("has_more", False),
                                     offset=event.get('offset', 0), loaded_count=restore.get('loaded_count', 0) if restore else 0,
-                                    geometry_prefix=stack_change['geometry_prefix'] if stack_change else None)
+                                    geometry_prefix=stack_change['geometry_prefix'] if stack_change else None,
+                                    layout_geometry=restore.get('layout_geometry') if restore else None)
             self.clear_details()
             if event["items"]:
                 self.gallery.setCurrentIndex(self.model.index(restore['selected_row'] if restore else 0))
