@@ -232,6 +232,11 @@ class Catalog:
         with self.db:
             self.db.execute("UPDATE jobs SET status='pending' WHERE status='running'")
             self.db.execute("UPDATE unit_jobs SET status='pending' WHERE status='running'")
+            # Prior versions could race with eviction of a shared preview. Only
+            # those reproducible cache misses are retried, not damaged originals.
+            for table in ('jobs','unit_jobs'):
+                self.db.execute(f"UPDATE {table} SET status='pending',error=NULL WHERE status='error' AND instr(error,?)>0 AND instr(error,'WinError 2')>0",
+                                (str(self.cfg.data_dir/'previews'),))
             from .media_units import UNIT_STAGES
             for stage, version in UNIT_STAGES.items():
                 self.db.execute("UPDATE unit_jobs SET status='pending',model_version=? WHERE stage=? AND model_version<>?", (version, stage, version))

@@ -26,10 +26,11 @@ class GPUUnavailable(RuntimeError):
 class Embedder:
     IMAGE_BATCH = 4
 
-    def __init__(self, cfg: Settings, profile=False, cpu_test_only=False):
+    def __init__(self, cfg: Settings, profile=False, cpu_test_only=False, provider='DmlExecutionProvider'):
         import onnxruntime as ort
         self.cfg = cfg
-        if not cpu_test_only and "DmlExecutionProvider" not in ort.get_available_providers():
+        self.provider = provider
+        if not cpu_test_only and provider not in ort.get_available_providers():
             raise GPUUnavailable("DirectML недоступен. Проверьте драйвер AMD и установку приложения.")
         self.sessions = {}
         self.ort = ort
@@ -57,11 +58,14 @@ class Embedder:
                 options.add_free_dimension_override_by_name(name, value)
             options.enable_profiling = self.profile
             options.profile_file_prefix = str(self.cfg.data_dir / "reports" / f"directml_{tower}")
-            providers = ["CPUExecutionProvider"] if self.cpu_test_only else [("DmlExecutionProvider", {"device_id": self.cfg.gpu_device}), "CPUExecutionProvider"]
+            options_gpu = {"device_id": self.cfg.gpu_device}
+            if self.provider == 'CUDAExecutionProvider':
+                options_gpu.update(use_tf32=0, cudnn_conv_algo_search='HEURISTIC')
+            providers = ["CPUExecutionProvider"] if self.cpu_test_only else [(self.provider, options_gpu), "CPUExecutionProvider"]
             model = self.cfg.data_dir / "models/siglip/onnx" / f"{tower}_model_fp16.onnx"
             session = self.ort.InferenceSession(str(model), sess_options=options, providers=providers)
             session.disable_fallback()
-            if not self.cpu_test_only and session.get_providers()[0] != "DmlExecutionProvider":
+            if not self.cpu_test_only and session.get_providers()[0] != self.provider:
                 raise GPUUnavailable("Модель не запущена на DirectML; автоматический переход на CPU запрещён.")
             self.sessions[tower] = session
         return self.sessions[tower]
@@ -76,7 +80,10 @@ class Embedder:
 
     def prepare_image(self, path: Path):
         """CPU-only input preparation, safe for bounded background threads."""
-        image = open_rgb(path).resize((224, 224), Image.Resampling(self.processor["resample"]))
+        return self.prepare_pil(open_rgb(path))
+
+    def prepare_pil(self, image):
+        image = image.resize((224, 224), Image.Resampling(self.processor["resample"]))
         array = np.asarray(image, dtype=np.float32) / 255
         array = (array - np.array(self.processor["image_mean"], dtype=np.float32)) / np.array(self.processor["image_std"], dtype=np.float32)
         return array.transpose(2, 0, 1)
@@ -215,12 +222,12 @@ class VisionLanguage:
             raise ValueError("Модель не завершила ответ")
         return json.loads(choice["message"]["content"])
 
-    def describe(self, path: Path):
+    def describe(self, path: Path | None = None, image_data=None):
         schema = {"type": "object", "properties": {
             "description": {"type": "string"}, "objects": {"type": "array", "items": {"type": "string"}},
             "actions": {"type": "array", "items": {"type": "string"}}, "uncertainties": {"type": "array", "items": {"type": "string"}}},
             "required": ["description", "objects", "actions", "uncertainties"], "additionalProperties": False}
-        return self.complete("Опиши фотографию по-русски для поиска в личном архиве. description: 2-3 конкретных предложения о видимой сцене, людях, обстановке и действиях. objects: до 12 видимых объектов, actions: до 6 действий, uncertainties: только реальные сомнения. Не угадывай имена людей, дату, географическое место. Не пиши длинные рассуждения.", schema, path)
+        return self.complete("Опиши фотографию по-русски для поиска в личном архиве. description: 2-3 конкретных предложения о видимой сцене, людях, обстановке и действиях. objects: до 12 видимых объектов, actions: до 6 действий, uncertainties: только реальные сомнения. Не угадывай имена людей, дату, географическое место. Не пиши длинные рассуждения.", schema, path, image_data=image_data)
 
     def parse(self, query: str):
         schema = {"type": "object", "properties": {"positive_query": {"type": "string"}, "conditions": {"type": "array", "maxItems": 8, "items": {"type": "string"}}}, "required": ["positive_query", "conditions"], "additionalProperties": False}

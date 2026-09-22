@@ -18,6 +18,7 @@ class ProcessingPipeline:
         self.inputs = EmbeddingInputs(engine)
         self.inventory = SourceInventory(self.catalog, engine.emit)
         self.captions = CaptionJobs(engine)
+        self.remote = None
         self.requests = self.catalog.state('scan_queue', [])
         self.scanner = None
         self.scan_state = None
@@ -39,7 +40,7 @@ class ProcessingPipeline:
 
     @property
     def idle(self):
-        return not self.scanning and not self.cpu.pending and not self.inputs.pending and not self.captions.pending
+        return not self.scanning and not self.cpu.pending and not self.inputs.pending and not self.captions.pending and not (self.remote and self.remote.pending)
 
     def request_scan(self, includes=None, skip_includes=(), reconcile=False):
         request = {'includes':list(self.engine.cfg.includes if includes is None else includes),
@@ -174,6 +175,8 @@ class ProcessingPipeline:
                                    'library_check': check}
 
     def close(self):
+        if self.remote:
+            self.remote.close()
         self.inventory.close()
         if self.scanner:
             self.scanner.close()

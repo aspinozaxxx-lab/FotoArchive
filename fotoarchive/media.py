@@ -5,6 +5,8 @@ import io
 import json
 import os
 import tempfile
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from PIL import Image, ImageOps
@@ -168,12 +170,16 @@ def sha256(path: Path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+_trim_lock = threading.Lock()
+_last_trim = {}
+
+
 class PreviewCache:
     def __init__(self, directory: Path, budget: int):
         self.directory, self.budget = directory, budget
         directory.mkdir(parents=True, exist_ok=True)
 
-    def get(self, asset: dict) -> Path:
+    def get(self, asset: dict, _retry=0) -> Path:
         is_video = Path(asset['path']).suffix.lower() in VIDEO_FORMATS
         timestamp = int(asset.get('timestamp_ms') or 0)
         key = f"{asset['id']}_{asset['version']}" + (f'_frame{timestamp}' if is_video else '') + '.jpg'
@@ -195,19 +201,49 @@ class PreviewCache:
                 temp.unlink(missing_ok=True)
             if is_video and asset.get('unit_thumbnail'):
                 save_thumbnail(image.copy(), Path(asset['unit_thumbnail']))
-            self.trim(exclude=target)
+            if time.monotonic()-_last_trim.get(str(self.directory),-60)>=60:
+                threading.Thread(target=self.trim,kwargs={'exclude':target},daemon=True).start()
         elif is_video and asset.get('unit_thumbnail') and not Path(asset['unit_thumbnail']).exists():
             with Image.open(target) as image:
                 save_thumbnail(image.copy(), Path(asset['unit_thumbnail']))
-        os.utime(target, None)
+        try:
+            os.utime(target, None)
+        except FileNotFoundError:
+            # Another process may have retired an old entry between exists()
+            # and touching it. Re-create it rather than failing recognition.
+            if _retry >= 2:
+                raise
+            return self.get(asset, _retry+1)
         return target
 
-    def trim(self, exclude=None):
-        files = [(p.stat().st_mtime, p.stat().st_size, p) for p in self.directory.glob("*.jpg")]
-        total = sum(s for _, s, _ in files)
-        for _, size, path in sorted(files):
-            if total <= self.budget:
-                break
-            if path != exclude:
-                path.unlink(missing_ok=True)
-                total -= size
+    def trim(self, exclude=None, force=False):
+        # Scanning tens of thousands of previews per photo dominates decoding.
+        # Maintenance is amortised and never performed twice concurrently.
+        key = str(self.directory)
+        if (not force and time.monotonic()-_last_trim.get(key, -60) < 60) or not _trim_lock.acquire(force):
+            return
+        try:
+            _last_trim[key] = time.monotonic()
+            files = []
+            for path in self.directory.glob('*.jpg'):
+                try:
+                    info = path.stat()
+                    files.append((info.st_mtime, info.st_size, path))
+                except OSError:
+                    pass
+            total = sum(s for _, s, _ in files)
+            for modified, size, path in sorted(files):
+                if total <= self.budget:
+                    break
+                if path != exclude:
+                    try:
+                        if not force:
+                            current = path.stat()
+                            if current.st_mtime != modified or time.time()-current.st_mtime<60:
+                                continue
+                        path.unlink(missing_ok=True)
+                        total -= size
+                    except OSError:
+                        pass
+        finally:
+            _trim_lock.release()

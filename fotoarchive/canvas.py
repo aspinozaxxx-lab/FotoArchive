@@ -1,6 +1,6 @@
 """Photo-first cells: no permanent filenames or dates; bounded hover previews."""
 from PySide6.QtCore import QEvent, QRect, QRectF, QPoint, QSize, Qt, QTimer, Signal, QVariantAnimation, QEasingCurve
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QLabel, QStyle, QStyledItemDelegate, QStyleOptionViewItem, QWidget
 from .gallery import PhotoModel
 from .smooth_scroll import PhotoGallery
@@ -72,18 +72,20 @@ class PhotoDelegate(QStyledItemDelegate):
         rect = option.rect.adjusted(2,2,-2,-2)
         selected = bool(option.state & QStyle.State_Selected)
         dark = option.palette.window().color().lightness() < 128
-        p.fillRect(rect, QColor('#25292c' if dark else '#e0e3e4'))
+        outline = QPainterPath()
+        outline.addRoundedRect(QRectF(rect), 4, 4)
+        p.fillPath(outline, QColor('#25292c' if dark else '#e0e3e4'))
         pixmap = index.data(PhotoModel.PixmapRole)
         if pixmap:
             p.save()
-            p.setClipRect(rect)
+            p.setClipPath(outline)
             scaled = pixmap.scaled(rect.size(), Qt.KeepAspectRatio if self.proportions or self.full_frame else Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
             p.drawPixmap(rect.x()+(rect.width()-scaled.width())//2,rect.y()+(rect.height()-scaled.height())//2,scaled)
             p.restore()
         if selected:
             p.setPen(QPen(QColor('#159e8f'),3))
             p.setBrush(Qt.NoBrush)
-            p.drawRect(rect.adjusted(1,1,-1,-1))
+            p.drawRoundedRect(rect.adjusted(1,1,-1,-1), 4, 4)
             p.fillRect(QRect(rect.right()-27,rect.top()+5,22,22),QColor('#147f72'))
             p.setPen(Qt.white)
             p.drawText(QRect(rect.right()-27,rect.top()+5,22,22),Qt.AlignCenter,'✓')
@@ -124,7 +126,17 @@ class StackMotion(QWidget):
         self.gallery, self.key, self.origin = gallery, key, QRectF(origin)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setGeometry(gallery.viewport().rect())
+        # Preserve the actual styled viewport, including gutters. The palette's
+        # Base colour is not the transparent list's background (in either theme).
+        self.snapshot = gallery.viewport().grab()
+        self.background = gallery.palette().window().color()
+        self.background = self.snapshot.toImage().pixelColor(0, 0)
         self.old = gallery.visible_cells()
+        for rect, _, _ in self.old.values():
+            point = QPoint(int(rect.left()+1),max(0,min(self.height()-1,int(rect.center().y()))))
+            if self.rect().contains(point):
+                self.background = self.snapshot.toImage().pixelColor(point)
+                break
         self.new = None
         self.progress = 0.0
         self.animation = QVariantAnimation(self)
@@ -138,6 +150,10 @@ class StackMotion(QWidget):
         self.expiry.setSingleShot(True)
         self.expiry.timeout.connect(self.hide)
         self.expiry.start(4000)
+        self.ready_timer = QTimer(self)
+        self.ready_timer.setInterval(16)
+        self.ready_timer.timeout.connect(self.finish)
+        self.ready_attempts = 0
         self.show()
 
     def advance(self, value):
@@ -145,17 +161,26 @@ class StackMotion(QWidget):
         self.update()
 
     def finish(self):
-        self.new = self.gallery.visible_cells()
+        if self.new is not None:
+            return
+        cells, ready = self.gallery.visible_cells(require_ready=True)
+        self.ready_attempts += 1
+        # A reset can finish its layout before the page or thumbnails arrive.
+        # Keep the exact old pixels until the replacement is actually drawable.
+        if not ready and self.ready_attempts < 120:
+            self.ready_timer.start()
+            return
+        self.ready_timer.stop()
+        self.new = cells
         self.expiry.stop()
         self.animation.start()
 
     def paintEvent(self, event):
         p = QPainter(self)
-        p.fillRect(self.rect(), self.gallery.palette().base())
         if self.new is None:
-            for rect, pixmap, _ in self.old.values():
-                p.drawPixmap(rect.toRect(), pixmap)
+            p.drawPixmap(0, 0, self.snapshot)
             return
+        p.fillRect(self.rect(), self.background)
         t = self.progress
         # The cover stays above the emerging members of its stack.
         keys = sorted(self.old.keys() | self.new.keys(),
@@ -203,7 +228,7 @@ class CanvasGallery(PhotoGallery):
         self.stop_hover()
         super().wheelEvent(event)
 
-    def visible_cells(self):
+    def visible_cells(self, require_ready=False):
         indexes = set()
         edge = self.itemDelegate().edge
         for y in [*range(0, self.viewport().height(), max(1, edge//2)), self.viewport().height()-1]:
@@ -212,24 +237,28 @@ class CanvasGallery(PhotoGallery):
                 if index.isValid():
                     indexes.add(index.row())
         cells = {}
+        ready = True
         for row in sorted(indexes)[:120]:
             index = self.model().index(row)
             asset = index.data(PhotoModel.AssetRole)
             rect = self.visualRect(index)
             if not asset or not rect.isValid():
+                ready = False
                 continue
+            if asset.get('thumbnail') and index.data(PhotoModel.PixmapRole) is None and asset['thumbnail'] not in self.model().failed:
+                ready = False
             option = QStyleOptionViewItem()
             option.initFrom(self)
             option.rect = QRect(QPoint(), rect.size())
             if self.selectionModel().isSelected(index):
                 option.state |= QStyle.State_Selected
             pixmap = QPixmap(rect.size())
-            pixmap.fill(self.palette().base().color())
+            pixmap.fill(Qt.transparent)
             painter = QPainter(pixmap)
             self.itemDelegate().paint(painter, option, index)
             painter.end()
             cells[asset['id']] = (QRectF(rect), pixmap, asset.get('stack_key'))
-        return cells
+        return (cells, ready and bool(cells)) if require_ready else cells
 
     def begin_stack_transition(self, key, rect):
         self.stop_stack_transition()

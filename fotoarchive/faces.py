@@ -41,9 +41,9 @@ def nms(boxes, scores, threshold=.3):
 
 
 class FaceModels:
-    def __init__(self, cfg, profile=False):
+    def __init__(self, cfg, profile=False, provider='DmlExecutionProvider'):
         import onnxruntime as ort
-        if "DmlExecutionProvider" not in ort.get_available_providers():
+        if provider not in ort.get_available_providers():
             raise GPUUnavailable("Для анализа лиц необходим DirectML.")
         self.sessions = {}
         for name in ("yunet", "sface"):
@@ -57,10 +57,13 @@ class FaceModels:
             if name == "yunet":
                 options.add_free_dimension_override_by_name("height", 960)
                 options.add_free_dimension_override_by_name("width", 960)
+            gpu_options = {"device_id": cfg.gpu_device}
+            if provider == 'CUDAExecutionProvider':
+                gpu_options.update(use_tf32=0, cudnn_conv_algo_search='HEURISTIC')
             session = ort.InferenceSession(str(cfg.data_dir / "models/faces" / (name + ".onnx")), sess_options=options,
-                providers=[("DmlExecutionProvider", {"device_id": cfg.gpu_device}), "CPUExecutionProvider"])
+                providers=[(provider, gpu_options), "CPUExecutionProvider"])
             session.disable_fallback()
-            if session.get_providers()[0] != "DmlExecutionProvider":
+            if session.get_providers()[0] != provider:
                 raise GPUUnavailable("Модель лиц не запущена на видеокарте.")
             self.sessions[name] = session
 
@@ -96,7 +99,10 @@ class FaceModels:
         return [predictions[i] for i in keep]
 
     def process(self, path):
-        rgb = np.asarray(open_rgb(Path(path)))
+        return self.process_pil(open_rgb(Path(path)))
+
+    def process_pil(self, image):
+        rgb = np.asarray(image)
         height, width = rgb.shape[:2]
         records = []
         for box, landmarks, confidence in self.detect(rgb):

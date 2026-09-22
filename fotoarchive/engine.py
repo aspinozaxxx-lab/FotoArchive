@@ -249,7 +249,7 @@ class Engine:
             cleanup.callback(self.pipeline.close)
 
 
-def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
+def worker_main(data_dir, commands, events, shutdown, interactive_state=None, remote_lifetime=None):
     """One owner for DB/index writes and GPU sessions; UI never runs inference."""
     cfg = Settings.load(data_dir)
 
@@ -270,6 +270,10 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
         from .orientation_engine import OrientationService
         orientation = OrientationService(engine)
         pipeline = engine.pipeline
+        if remote_lifetime is not None:
+            from .remote_jobs import RemoteJobs
+            pipeline.remote = RemoteJobs(engine,lambda: not shutdown.is_set() and
+                remote_lifetime[1]>0 and remote_lifetime[2]>0 and time.monotonic()-remote_lifetime[0]<6)
         paused = engine.catalog.state("paused", True)
         previous_formats = set(engine.catalog.state('media_formats', ['.jpg', '.jpeg', '.bmp']))
         if SUPPORTED - previous_formats:
@@ -286,6 +290,15 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
         emit({"type": "ready", "facets": engine.catalog.facets(), "includes": cfg.includes})
         pipeline.inventory.ensure()
         while not shutdown.is_set():
+            if pipeline.remote:
+                pipeline.remote.set_active(not paused)
+                if pipeline.remote.collect():
+                    maintenance_needed = True
+            if not cfg.local_enabled and not pipeline.captions.pending:
+                if engine.vlm:
+                    engine.vlm.close()
+                    engine.vlm = None
+                engine.embedder = engine.face_models = None
             try:
                 pipeline.inventory.collect()
                 if pipeline.captions.collect():
@@ -298,11 +311,15 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
                 pipeline.cpu.recover_broken()
                 pipeline.inputs.cancel()
                 pipeline.captions.cancel()
-                paused = True
-                engine.catalog.set_state('paused',True)
+                if isinstance(exc,GPUUnavailable) and cfg.remote_enabled:
+                    cfg.local_enabled = False
+                    cfg.save()
+                else:
+                    paused = True
+                engine.catalog.set_state('paused',paused)
                 emit({'type':'error','message':str(exc)})
             try:
-                command = commands.get(timeout=0 if reviewing is not None else 0.005 if (pipeline.scanning or checking or not paused or pipeline.cpu.pending) else 0.2)
+                command = commands.get(timeout=0 if reviewing is not None else 0.005 if (pipeline.scanning or checking or (not paused and cfg.local_enabled) or pipeline.cpu.pending) else 0.2)
             except queue.Empty:
                 command = None
             if command:
@@ -326,6 +343,23 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
                         pipeline.captions.cancel()
                         pipeline.cpu.cancel()
                         engine.catalog.set_state("paused", True)
+                    elif action == 'remote_enabled':
+                        cfg.remote_enabled = bool(command['enabled'])
+                        if not cfg.remote_enabled and pipeline.remote:
+                            pipeline.remote.cancel()
+                        if cfg.remote_enabled:
+                            paused = False
+                            engine.catalog.set_state('paused',False)
+                        cfg.save()
+                    elif action == 'local_enabled':
+                        cfg.local_enabled = bool(command['enabled'])
+                        if not cfg.local_enabled:
+                            pipeline.inputs.cancel()
+                            pipeline.captions.cancel()
+                        else:
+                            paused = False
+                            engine.catalog.set_state('paused',False)
+                        cfg.save()
                     elif action == "resume":
                         paused = False
                         engine.catalog.set_state("paused", False)
@@ -521,15 +555,22 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
                 try:
                     pipeline.scan_tick()
                     pipeline.cpu.fill()
-                    pipeline.inputs.fill()
-                    if not checking and reviewing is None:
+                    if pipeline.remote:
+                        pipeline.remote.fill()
+                    if cfg.local_enabled:
+                        pipeline.inputs.fill()
+                    if cfg.local_enabled and not checking and reviewing is None:
                         pipeline.captions.fill()
                 except Exception as exc:
                     pipeline.cpu.cancel()
                     pipeline.inputs.cancel()
                     pipeline.captions.cancel()
-                    paused = True
-                    engine.catalog.set_state('paused',True)
+                    if isinstance(exc,GPUUnavailable) and cfg.remote_enabled:
+                        cfg.local_enabled = False
+                        cfg.save()
+                    else:
+                        paused = True
+                    engine.catalog.set_state('paused',paused)
                     emit({'type':'error','message':str(exc)})
             if reviewing is not None:
                 try:
@@ -556,13 +597,15 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
                       "groups": context.groups(), "has_more": not context.exhausted, **context.counts(),**presentation_state})
                 if not checking:
                     emit({"type": "verification_done", "id": context.request_id, **context.counts(), "exhausted": not context.can_verify()})
-            elif orientation.tick(allow_analysis=paused):
+            elif orientation.tick(allow_analysis=paused and cfg.local_enabled):
                 pass
             elif not paused:
                 try:
-                    job = pipeline.process_gpu()
+                    job = pipeline.process_gpu() if cfg.local_enabled else None
                     maintenance_needed = True
-                    if job is None and pipeline.idle:
+                    unfinished = (not cfg.local_enabled and engine.catalog.db.execute("""SELECT 1 FROM jobs j JOIN assets a ON a.id=j.asset_id
+                        WHERE j.status IN ('pending','running') AND a.present=1 AND j.file_version=a.version LIMIT 1""").fetchone()) if job is None and pipeline.idle else True
+                    if job is None and pipeline.idle and not unfinished:
                         pipeline.cpu.close()
                         engine.index.flush_all()
                         engine.index.maintain()
@@ -571,11 +614,15 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
                         engine.catalog.set_state("paused", True)
                         emit({"type": "index_done", "stats": engine.catalog.stats(), "facets": engine.catalog.facets()})
                 except GPUUnavailable as exc:
-                    paused = True
+                    if cfg.remote_enabled:
+                        cfg.local_enabled = False
+                        cfg.save()
+                    else:
+                        paused = True
                     pipeline.cpu.cancel()
                     pipeline.inputs.cancel()
                     pipeline.captions.cancel()
-                    engine.catalog.set_state("paused", True)
+                    engine.catalog.set_state("paused", paused)
                     emit({"type": "error", "message": str(exc)})
                 except Exception as exc:
                     paused = True
@@ -590,6 +637,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None):
                 maintenance_needed = False
             if time.monotonic() - last_status > 1:
                 emit({"type": "status", "stats": engine.catalog.stats(), "paused": paused,
+                      "local_enabled":cfg.local_enabled,"remote_enabled":cfg.remote_enabled,
                       "scanning":pipeline.scanning, "scan":pipeline.scan_state,"pipeline":pipeline.status(),
                       "inventory": pipeline.inventory.status()})
                 emit({'type':'orientation_progress','stats':orientation.store.stats()})

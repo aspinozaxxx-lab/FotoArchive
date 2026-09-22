@@ -6,6 +6,7 @@ import multiprocessing as mp
 import os
 import queue
 import subprocess
+import time
 from collections import OrderedDict
 from dataclasses import asdict
 from pathlib import Path
@@ -43,6 +44,7 @@ QPushButton:disabled { color: #a5afb4; background: #f1f3f5; }
 QPushButton#primary { color: white; background: #177c70; border-color: #177c70; font-weight: 600; }
 QPushButton#primary:hover { background: #116459; }
 QListView { background: transparent; border: none; outline: 0; }
+QListView#photoGallery { background: #f4f6f8; }
 QProgressBar { border: 0; background: #e7edee; border-radius: 3px; height: 6px; max-height: 6px; }
 QProgressBar::chunk { background: #389c8a; border-radius: 3px; }
 QTextBrowser { border: none; background: transparent; }
@@ -65,12 +67,13 @@ class Backend(QObject):
         self.events = context.Queue(maxsize=256)
         self.shutdown = context.Event()
         self.interactive_state = context.Array('q', [0, 0], lock=False)
+        self.remote_lifetime = context.Array('d', [time.monotonic(), 1, int(cfg.remote_enabled)], lock=False)
         from .browse_reader import BrowseReader
         self.reader = BrowseReader(cfg, self.event.emit)
         from .library import LibraryReader
         self.library = LibraryReader(cfg, self.event.emit)
         self.browse_id = None
-        self.process = context.Process(target=worker_main, args=(str(cfg.data_dir), self.commands, self.events, self.shutdown, self.interactive_state), daemon=False)
+        self.process = context.Process(target=worker_main, args=(str(cfg.data_dir), self.commands, self.events, self.shutdown, self.interactive_state, self.remote_lifetime), daemon=False)
         self.process.start()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -80,6 +83,14 @@ class Backend(QObject):
     def send(self, **message):
         from .interactive import SEARCH_ACTIONS
         action = message['action']
+        if action == 'remote_enabled':
+            self.remote_lifetime[2] = int(bool(message['enabled']))
+        if action in ('pause','stop'):
+            self.remote_lifetime[1] = 0
+        elif action in ('resume','scan','check_updates','add_folder','add_folders','retry'):
+            self.remote_lifetime[1] = 1
+        elif action in ('remote_enabled','local_enabled') and message.get('enabled'):
+            self.remote_lifetime[1] = 1
         if action.startswith('library_'):
             self.library.send(message)
             return
@@ -102,6 +113,7 @@ class Backend(QObject):
             self.event.emit({"type": "error", "message": "Очередь занята. Дождитесь текущей операции."})
 
     def poll(self):
+        self.remote_lifetime[0] = time.monotonic()
         for _ in range(100):
             try:
                 event = self.events.get_nowait()
@@ -116,6 +128,7 @@ class Backend(QObject):
             self.event.emit({"type": "fatal", "message": "Фоновый процесс остановился. Результаты сохранены; перезапустите приложение."})
 
     def close(self):
+        self.remote_lifetime[1] = 0
         self.timer.stop()
         self.reader.close()
         self.library.close()
@@ -189,8 +202,10 @@ class Viewer(QDialog):
             items.assetsReady.connect(self.assets_ready)
         self.load_token = 0
         self.original_loaded = False
-        self.pool = QThreadPool(self)
-        self.pool.setMaxThreadCount(1)
+        self.pool = QThreadPool.globalInstance()
+        from .preview_buffer import PreviewBuffer
+        self.preview_buffer = PreviewBuffer(cfg)
+        self.preview_buffer.ready.connect(self.buffer_ready)
         self.preview_signals = PreviewSignals()
         self.preview_signals.ready.connect(self.loaded)
         self.setWindowTitle("Просмотр фотографии")
@@ -228,24 +243,57 @@ class Viewer(QDialog):
 
     def load(self, original=False):
         self.asset = self.items.asset(self.position) if isinstance(self.items, PhotoModel) else self.items[self.position]
-        self.scene.clear()
         self.load_token += 1
         self.original_loaded = False
-        self.pool.clear()
+        self.loading_original = original
         self.faces = []
+        for item in self.scene.items():
+            if isinstance(item, FaceBox):
+                self.scene.removeItem(item)
         if not self.asset:
             self.waiting = True
             self.label.setText("Загрузка следующей части каталога…")
             return
         self.waiting = False
         self.label.setText(f"Загрузка · {self.asset['filename']}")
-        self.pool.start(PreviewTask(self.load_token, self.asset, self.cfg, original, self.preview_signals))
+        if original:
+            self.pool.start(PreviewTask(self.load_token, self.asset, self.cfg, True, self.preview_signals), 100)
+        else:
+            cached = self.preview_buffer.get(self.asset)
+            if cached is not None:
+                self.loaded(self.load_token, cached, '', False)
+            elif isinstance(self.items, PhotoModel):
+                thumbnail = self.items.cache.get(str(self.asset.get('thumbnail') or ''))
+                if thumbnail is not None:
+                    self.scene.clear()
+                    self.scene.addPixmap(thumbnail)
+                    self.scene.setSceneRect(0,0,thumbnail.width(),thumbnail.height())
+                    self.fit()
+            self.prefetch()
         if self.backend:
             self.backend.send(action="faces", asset_id=self.asset["id"], unit_id=self.asset.get('unit_id'))
 
     def assets_ready(self, start, end):
         if self.waiting and start <= self.position <= end:
             self.load()
+        elif not self.finished_cleanup and self.asset:
+            self.prefetch()
+
+    def prefetch(self):
+        count = self.items.rowCount() if isinstance(self.items, PhotoModel) else len(self.items)
+        neighbours = []
+        for row in [*range(self.position+1, min(count, self.position+6)), *range(self.position-1,max(-1,self.position-6),-1)]:
+            asset = self.items.asset(row) if isinstance(self.items, PhotoModel) else self.items[row]
+            if asset:
+                neighbours.append(asset)
+        self.preview_buffer.prepare(self.asset, neighbours)
+        if isinstance(self.items, PhotoModel) and self.position+5 >= count and self.items.canFetchMore():
+            self.items.fetchMore()
+
+    def buffer_ready(self, key, image, error):
+        from .preview_buffer import preview_key
+        if not self.finished_cleanup and not self.loading_original and self.asset and preview_key(self.asset) == key:
+            self.loaded(self.load_token, image, error, False)
 
     def on_event(self, event):
         if event["type"] == "face_list" and self.asset and (event["asset_id"], event["version"]) == (self.asset["id"], self.asset["version"]):
@@ -284,12 +332,13 @@ class Viewer(QDialog):
         self.personSelected.emit(face_id)
 
     def loaded(self, token, image, error, original):
-        if token != self.load_token:
+        if token != self.load_token or self.finished_cleanup:
             return
         if error:
             self.label.setText(f"Оригинал недоступен: {error}")
             return
         self.original_loaded = original
+        self.scene.clear()
         self.label.setText(f"{self.position + 1} · {self.asset['filename']}")
         if self.asset.get('media_kind') == 'video':
             self.label.setText(self.asset['filename'] + ' · кадр ' + timestamp_text(self.asset.get('timestamp_ms')))
@@ -347,8 +396,7 @@ class Viewer(QDialog):
     def done(self, result):
         if not self.finished_cleanup:
             self.finished_cleanup = True
-            self.pool.clear()
-            self.pool.waitForDone(3000)
+            self.preview_buffer.close()
             if self.backend:
                 self.backend.event.disconnect(self.on_event)
             if isinstance(self.items, PhotoModel):
@@ -490,6 +538,9 @@ class MainWindow(Workspace, QMainWindow):
         self.pipeline_label.setObjectName('muted')
         self.pipeline_label.setWordWrap(True)
         outer.addWidget(self.pipeline_label)
+        from .remote_panel import RemotePanel
+        self.remote_panel = RemotePanel(cfg,self.backend)
+        outer.addWidget(self.remote_panel)
         source_row = QHBoxLayout()
         self.source_label = QLabel('Подсчитываю состав добавленных папок…')
         self.source_label.setObjectName('muted')
@@ -1297,6 +1348,12 @@ class MainWindow(Workspace, QMainWindow):
         if self.workspace_event(event):
             return
         kind = event["type"]
+        if kind == 'remote_status':
+            self.remote_panel.update_status(event['remote'])
+            return
+        if kind == 'remote_notice':
+            self.remote_panel.state.setToolTip(event['message'])
+            return
         if kind == 'library_check':
             check = event['check']
             self.show_library_check(check)
@@ -1401,6 +1458,12 @@ class MainWindow(Workspace, QMainWindow):
             self.source_inventory = event['inventory']
             self.show_processing_progress()
         elif kind == "status":
+            for field,control in [('local_enabled',self.remote_panel.local),('remote_enabled',self.remote_panel.enabled)]:
+                if field in event:
+                    control.blockSignals(True)
+                    control.setChecked(event[field])
+                    control.blockSignals(False)
+                    setattr(self.cfg,field,event[field])
             stats = event["stats"]
             self.latest_stats = stats
             if 'inventory' in event:
@@ -1422,6 +1485,8 @@ class MainWindow(Workspace, QMainWindow):
                            'проверка ориентации' if self.orientation_stats.get('running') else
                            'поворот и обновление поиска' if self.orientation_stats.get('edits_pending') else
                            'индексация на паузе' if stats['pending'] else 'индексация завершена')
+                elif not event.get('local_enabled',True):
+                    gpu = 'завершает текущее описание' if pipeline.get('caption_running') else 'локальная обработка выключена'
                 frames = stats.get('video_frames', {})
                 frame_text = (f"  ·  Кадры видео: поиск {frames.get('embedding', 0)}, лица {frames.get('faces', 0)}, "
                               f"описания {frames.get('caption', 0)} из {frames['total']}") if frames.get('total') else ''
@@ -1451,6 +1516,8 @@ class MainWindow(Workspace, QMainWindow):
             elif self.paused:
                 self.stage_label.setText("Индексация на паузе" if stats["pending"] else
                                         f"Обработка завершена · ошибок: {stats['errors']}" if stats["errors"] else "Все выбранные фотографии обработаны")
+            elif not event.get('local_enabled',True) and not pipeline.get('caption_running'):
+                self.stage_label.setText('Локальная обработка выключена' if event.get('remote_enabled') else 'Распознавание выключено')
             if event.get("scanning") and not pipeline:
                 self.stage_label.setText("Сканирую выбранные папки…")
         elif kind == "working":

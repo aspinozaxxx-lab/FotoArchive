@@ -108,6 +108,34 @@ def test_layout_roles_do_not_fetch_offscreen_records(qtbot):
     assert requests==[40000]
 
 
+@pytest.mark.parametrize('theme',['light','dark'])
+def test_stack_holds_identical_pixels_until_new_cells_are_ready(qtbot,stack_window,theme):
+    w=stack_window
+    w.apply_theme(theme,save=False)
+    qtbot.wait(100)
+    rect=w.gallery.visualRect(w.model.index(2))
+    before=w.gallery.viewport().grab().toImage()
+    w.gallery.begin_stack_transition('sample',rect)
+    qtbot.wait(20)
+    motion=w.gallery.stack_motion
+    assert motion.snapshot.toImage()==before
+    after=w.gallery.viewport().grab().toImage()
+    import numpy as np
+    a=np.frombuffer(before.bits(),dtype=np.uint8).reshape(before.height(),before.width(),4)
+    b=np.frombuffer(after.bits(),dtype=np.uint8).reshape(after.height(),after.width(),4)
+    ys,xs=np.where((a!=b).any(axis=2))
+    assert after==before, (len(xs), (int(xs.min()),int(ys.min()),int(xs.max()),int(ys.max())),
+                           a[ys[0],xs[0]].tolist(),b[ys[0],xs[0]].tolist())
+    # Reproduce a delayed page after a model reset. No frame may show empty
+    # cells or a palette-coloured flash while asynchronous records are absent.
+    w.model.blocks.clear()
+    w.gallery.viewport().update()
+    w.gallery.finish_stack_transition()
+    assert motion.new is None
+    assert w.gallery.viewport().grab().toImage()==before
+    w.gallery.stop_stack_transition()
+
+
 def test_page_append_while_scrolled_keeps_position(qtbot,stack_window):
     w=stack_window
     while w.model.rowCount()<1000:

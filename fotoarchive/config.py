@@ -37,6 +37,10 @@ class Settings:
     gpu_device: int = 0
     ann_threshold: int = 10_000
     preparation_workers: int = 0
+    remote_enabled: bool = False
+    local_enabled: bool = True
+    remote_host: str = 'gpu-mlserver'
+    remote_port: int = 18765
 
     def initialize(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +60,10 @@ class Settings:
             obj.preview_budget = int(saved.get("preview_budget", obj.preview_budget))
             obj.gpu_device = int(saved.get("gpu_device", 0))
             obj.preparation_workers = max(0, min(8, int(saved.get("preparation_workers", 0))))
+            obj.remote_enabled = bool(saved.get('remote_enabled', False))
+            obj.local_enabled = bool(saved.get('local_enabled', True))
+            obj.remote_host = saved.get('remote_host', 'gpu-mlserver')
+            obj.remote_port = int(saved.get('remote_port', 18765))
         return obj
 
     def save(self):
@@ -64,6 +72,9 @@ class Settings:
         temp = path.with_suffix(".tmp")
         temp.write_text(json.dumps({"root": str(self.root), "includes": self.includes,
                                    "preview_budget": self.preview_budget, "gpu_device": self.gpu_device,
-                                   "preparation_workers": self.preparation_workers},
+                                   "preparation_workers": self.preparation_workers,
+                                   "remote_enabled": self.remote_enabled, "remote_host": self.remote_host,
+                                   "local_enabled": self.local_enabled,
+                                   "remote_port": self.remote_port},
                                   ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)

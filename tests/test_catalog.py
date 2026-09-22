@@ -133,7 +133,27 @@ def test_preview_cache_enforces_budget(cfg):
     cache = PreviewCache(cfg.data_dir / "previews", budget=1)
     old = cache.get(a)
     new = cache.get(b)
+    cache.trim(exclude=new, force=True)
     assert new.exists() and not old.exists()
+    cat.close()
+
+
+def test_preview_cache_recovers_an_evicted_entry(cfg,monkeypatch):
+    import os
+    cat=Catalog(cfg)
+    asset=cat.get(prepare(cat,make_image(cfg)))
+    cache=PreviewCache(cfg.data_dir/'previews',budget=20*1024**3)
+    path=cache.get(asset)
+    original=os.utime
+    removed=[]
+    def evict_once(target,*args,**kwargs):
+        if str(target)==str(path) and not removed:
+            path.unlink()
+            removed.append(True)
+        return original(target,*args,**kwargs)
+    monkeypatch.setattr(os,'utime',evict_once)
+    assert cache.get(asset).is_file()
+    assert removed
     cat.close()
 
 def test_only_one_catalog_worker(cfg):
