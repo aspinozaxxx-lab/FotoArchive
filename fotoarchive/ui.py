@@ -1458,6 +1458,7 @@ class MainWindow(Workspace, QMainWindow):
             self.source_inventory = event['inventory']
             self.show_processing_progress()
         elif kind == "status":
+            self.remote_panel.update_local(event)
             for field,control in [('local_enabled',self.remote_panel.local),('remote_enabled',self.remote_panel.enabled)]:
                 if field in event:
                     control.blockSignals(True)

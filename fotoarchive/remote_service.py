@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from .remote_protocol import MAX_PACKED
 from .remote_store import Store
@@ -57,6 +58,7 @@ class Supervisor:
         self.started = self.clock()
         self.last_error = ''
         self.retry_at = 0
+        self.completions = deque(maxlen=10000)
 
     def lease(self, session, active):
         if not isinstance(session,str) or not 16 <= len(session) <= 80 or not isinstance(active,bool):
@@ -65,6 +67,7 @@ class Supervisor:
             if self.session != session and self.clock() < self.deadline:
                 raise ValueError('Another app session is connected')
             self.session = session
+            self.store.active_session = session if active else ''
             self.deadline = self.clock()+LEASE_SECONDS if active else 0
             if not active:
                 self.stop()
@@ -76,8 +79,10 @@ class Supervisor:
             raise ValueError('App lease expired')
 
     def status(self):
+        while self.completions and self.completions[0]<=self.clock()-60:
+            self.completions.popleft()
         return dict(state=self.state,gpu=self.gpu,lease_seconds=LEASE_SECONDS,error=self.last_error,
-                    rate=self.completed*60/max(1,self.clock()-self.started),**self.store.stats(self.session))
+                    rate=len(self.completions),**self.store.stats(self.session))
 
     def start(self):
         env = dict(os.environ, FOTOARCHIVE_REMOTE_DATA=str(self.directory))
@@ -116,6 +121,7 @@ class Supervisor:
         with self.lock:
             now = self.clock()
             if now >= self.deadline:
+                self.store.active_session = ''
                 if self.worker:
                     self.stop()
                 self.state = 'disconnected'
@@ -138,6 +144,8 @@ class Supervisor:
                 pid, result = self.messages.get_nowait()
                 if self.worker and pid == self.worker.pid and self.current and result['id'] == self.current['id']:
                     self.store.finish(result['id'], result)
+                    if self.store.outcome(self.current['stages'],result)=='complete':
+                        self.completions.append(now)
                     self.current = None
                     self.completed += bool(result.get('stages'))
                     self.idle_since = now
@@ -165,6 +173,7 @@ class Supervisor:
 
 def serve(supervisor, token, host='127.0.0.1', port=18765):
     class Handler(BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
         def log_message(self, *_):
             pass  # No tokens, photo contents or original filenames in logs.
 
@@ -194,6 +203,13 @@ def serve(supervisor, token, host='127.0.0.1', port=18765):
                     if not supervisor.store.has(path[1]):
                         raise FileNotFoundError()
                     result = {'cached':True}
+                elif self.command=='POST' and path==['results']:
+                    result = dict(items=supervisor.store.ready(body['keys']),missing=supervisor.store.missing(body['keys']))
+                elif self.command=='POST' and path==['receipts']:
+                    with supervisor.lock:
+                        supervisor.require_lease(body['session'])
+                        supervisor.store.acknowledge(body['session'],body['receipts'])
+                    result = {'ok':True}
                 elif self.command=='POST' and path==['jobs']:
                     with supervisor.lock:
                         supervisor.require_lease(body['session'])

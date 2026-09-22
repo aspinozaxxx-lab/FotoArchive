@@ -168,7 +168,10 @@ def test_video_bundle_uses_one_timestamp_for_all_stages(tmp_path):
 
 def test_stale_result_cannot_overwrite_replaced_file(tmp_path,monkeypatch):
     cat=ready_catalog(tmp_path)
-    fake=SimpleNamespace(results=queue.Queue(),close=lambda:None,cancel=lambda:None)
+    receipts=[]
+    connected=threading.Event();connected.set()
+    fake=SimpleNamespace(results=queue.Queue(),queue=queue.Queue(maxsize=64),active=True,connected=connected,
+        close=lambda:None,cancel=lambda:None,acknowledge=lambda key,value:receipts.append((key,value)))
     monkeypatch.setattr('fotoarchive.remote_jobs.Transport',lambda *args:fake)
     engine=SimpleNamespace(catalog=cat,cfg=cat.cfg,emit=lambda e:None,flush_progress=lambda n:None)
     remote=RemoteJobs(engine,lambda:True)
@@ -178,9 +181,14 @@ def test_stale_result_cannot_overwrite_replaced_file(tmp_path,monkeypatch):
     cat.register(Path(asset['path']))
     fake.results.put((1,dict(stages={'caption':{'description':'old'}},elapsed=1,key='old',providers={}),''))
     remote.collect()
+    assert receipts==[('old','discarded')]
     assert cat.get(asset['id'])['description']==''
     assert cat.get(asset['id'])['version']==2
     assert cat.db.execute("SELECT status FROM jobs WHERE asset_id=? AND stage='caption'",(asset['id'],)).fetchone()[0]=='pending'
+    cat.cfg.remote_enabled=True
+    remote.fill()
+    assert not fake.queue.empty() and remote.retry_at==0
+    assert all(a['id']!=asset['id'] for a,_ in remote.pending.values())
     cat.close()
 
 
@@ -200,3 +208,126 @@ def test_independent_controls_persist(tmp_path):
         cfg.save()
         saved=Settings.load(tmp_path)
         assert (saved.local_enabled,saved.remote_enabled)==(local,remote)
+
+
+def test_success_requires_all_stages_and_receipt_follows_commit(tmp_path):
+    store=Store(tmp_path)
+    data=pack(photo_data());blob=digest(data);store.put(blob,data)
+    stages={'embedding':EMBED_VERSION,'caption':CAPTION_VERSION}
+    key=store.submit('session',blob,stages)
+    store.take('session')
+    store.finish(key,{'stages':{'embedding':[1],'caption':{'description':'red'}},'errors':{}})
+    assert store.stats('session')['completed']==1
+    assert store.stats('session')['saved']==0
+    assert store.stats('session')['awaiting_save']==1
+    assert store.ready([key])[0]['key']==key
+    assert store.stats('session')['saved']==0  # Download is not a commit.
+    store.acknowledge('session',{key:'saved'});store.acknowledge('session',{key:'saved'})
+    assert store.stats('session')['saved']==1 and store.stats('session')['awaiting_save']==0
+    partial=store.submit('session',blob,{'caption':CAPTION_VERSION})
+    store.take('session');store.finish(partial,{'stages':{},'errors':{'caption':'model error'}})
+    assert store.stats('session')['completed']==1 and store.stats('session')['failed']==1
+    store.submit('second-session',blob,stages)
+    assert store.stats('second-session')['completed']==1 and store.stats('second-session')['saved']==0
+    store.db.close()
+
+
+def test_active_reserve_is_pinned_and_eviction_keeps_completed_totals(tmp_path):
+    data=pack(photo_data());blob=digest(data)
+    store=Store(tmp_path,budget=len(data)+250)
+    store.active_session='session'
+    store.put(blob,data)
+    key=store.submit('session',blob,{'caption':CAPTION_VERSION})
+    other=pack(b'other data'*500)
+    store.budget=len(data)+len(other)-1
+    with pytest.raises(ValueError):store.put(digest(other),other)
+    assert store.has(blob)
+    store.budget=10000
+    store.take('session');store.finish(key,{'stages':{'caption':{}},'errors':{}})
+    store.acknowledge('session',{key:'saved'})
+    store.budget=len(other)+10
+    store.put(digest(other),other)
+    assert not store.has(blob)
+    assert store.stats('session')['completed']==store.stats('session')['saved']==1
+    store.db.close()
+
+
+def test_server_reserve_can_refill_beyond_128_without_unbounded_upload_queue(tmp_path,monkeypatch):
+    cat=ready_catalog(tmp_path)
+    fake=SimpleNamespace(queue=queue.Queue(maxsize=64),results=queue.Queue(),active=True,
+        connected=threading.Event(),close=lambda:None,cancel=lambda:None)
+    fake.connected.set()
+    monkeypatch.setattr('fotoarchive.remote_jobs.Transport',lambda *args:fake)
+    bundle=(dict(id=1),[dict(stage='caption',model_version=CAPTION_VERSION)])
+    monkeypatch.setattr('fotoarchive.remote_jobs.claim_bundle',lambda *args:bundle)
+    cat.cfg.remote_enabled=True
+    engine=SimpleNamespace(catalog=cat,cfg=cat.cfg,emit=lambda e:None)
+    remote=RemoteJobs(engine,lambda:True)
+    for _ in range(16):
+        remote.fill()
+        assert fake.queue.qsize()<=64
+        while not fake.queue.empty():fake.queue.get_nowait()
+    assert len(remote.pending)>128
+    cat.close()
+
+
+def test_traffic_reports_bytes_during_upload_and_decays_at_idle():
+    from fotoarchive.remote_client import Traffic,UploadBody
+    clock=[0.];traffic=Traffic(clock=lambda:clock[0])
+    body=UploadBody(b'x'*2000,traffic)
+    assert len(body.read(1000))==1000
+    clock[0]=2
+    first=traffic.snapshot()
+    assert first['sent']==1000 and first['upload_bps']==500
+    body.read();traffic.add(received=100)
+    clock[0]=4
+    assert traffic.snapshot()['upload_bps']==500
+    clock[0]=20;traffic.snapshot()
+    clock[0]=32
+    assert traffic.snapshot()['upload_bps']==0
+
+
+def test_result_delivery_and_receipt_do_not_wait_for_slow_upload(tmp_path,monkeypatch):
+    from fotoarchive.remote_client import Transport
+    supervisor=Supervisor(tmp_path/'server',probe=lambda *args:dict(utilization=0,memory_mb=0,total_mb=32000,foreign=[{'pid':1}]))
+    server=serve(supervisor,'s'*32,port=0)
+    serving=threading.Thread(target=server.serve_forever,daemon=True);serving.start()
+    cfg=Settings(data_dir=tmp_path/'client',remote_enabled=True);cfg.initialize()
+    (cfg.data_dir/'remote-token').write_text('s'*32)
+    release=threading.Event();preparing=threading.Event()
+    def open_tunnel(self):
+        self.base=f'http://127.0.0.1:{server.server_port}'
+        self.tunnel=SimpleNamespace(poll=lambda:None)
+    def close_tunnel(self):
+        self.connected.clear();self.tunnel=None
+    def slow_prepare(*_):
+        preparing.set();release.wait(8)
+        return pack(photo_data())
+    monkeypatch.setattr(Transport,'open_tunnel',open_tunnel)
+    monkeypatch.setattr(Transport,'close_tunnel',close_tunnel)
+    monkeypatch.setattr('fotoarchive.remote_client.prepare',slow_prepare)
+    transport=Transport(cfg,lambda:True,lambda e:None);transport.active=True
+    try:
+        assert transport.connected.wait(5)
+        data=pack(photo_data());blob=digest(data);supervisor.store.put(blob,data)
+        key=supervisor.store.submit(transport.session_id,blob,{'caption':CAPTION_VERSION})
+        supervisor.store.take(transport.session_id)
+        supervisor.store.finish(key,dict(stages={'caption':{'description':'red'}},errors={},elapsed=1))
+        with transport.pending_lock:transport.pending[1]=key
+        transport.queue.put((2,dict(id=2),{'caption':CAPTION_VERSION}))
+        assert preparing.wait(2)
+        started=time.monotonic()
+        serial,result,error=transport.results.get(timeout=2)
+        assert serial==1 and not error and result['key']==key
+        assert time.monotonic()-started<1.5
+        assert supervisor.store.stats(transport.session_id)['saved']==0
+        transport.acknowledge(key,'saved')
+        deadline=time.monotonic()+2
+        while supervisor.store.stats(transport.session_id)['saved']==0 and time.monotonic()<deadline:
+            time.sleep(.01)
+        assert supervisor.store.stats(transport.session_id)['saved']==1
+        assert not release.is_set()  # Slow input still blocked, independently.
+    finally:
+        transport.active=False;release.set();transport.close()
+        transport.upload_thread.join(3);transport.result_thread.join(3)
+        server.shutdown();server.server_close();serving.join(2);supervisor.store.db.close()

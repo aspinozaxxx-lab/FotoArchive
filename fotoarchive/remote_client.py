@@ -8,10 +8,46 @@ import socket
 import subprocess
 import threading
 import time
+from collections import deque
 from pathlib import Path
 import requests
 from .media import open_rgb, visual_path
-from .remote_protocol import digest, pack, job_key, MAX_INPUT
+from .remote_protocol import digest, pack, job_key, MAX_INPUT, UPLOAD_AHEAD
+
+
+class Traffic:
+    def __init__(self, clock=time.monotonic):
+        self.clock, self.lock = clock, threading.Lock()
+        self.sent = self.received = 0
+        self.samples = deque([(clock(),0,0)],maxlen=32)
+
+    def add(self, sent=0, received=0):
+        with self.lock:
+            self.sent += sent
+            self.received += received
+
+    def snapshot(self):
+        with self.lock:
+            now = self.clock()
+            while len(self.samples)>1 and self.samples[1][0]<=now-10:
+                self.samples.popleft()
+            old = self.samples[0]
+            rates = dict(sent=self.sent,received=self.received,
+                upload_bps=(self.sent-old[1])/max(.1,now-old[0]),
+                download_bps=(self.received-old[2])/max(.1,now-old[0]))
+            self.samples.append((now,self.sent,self.received))
+            return rates
+
+
+class UploadBody(io.BytesIO):
+    def __init__(self, data, traffic):
+        super().__init__(data)
+        self.traffic = traffic
+
+    def read(self, size=-1):
+        data = super().read(size)
+        self.traffic.add(sent=len(data))
+        return data
 
 
 def prepare(asset, cfg):
@@ -42,21 +78,27 @@ class Transport:
         self.active = False
         self.closed = threading.Event()
         self.connected = threading.Event()
-        self.queue = queue.Queue(maxsize=128)
-        self.results = queue.Queue(maxsize=256)
+        self.queue = queue.Queue(maxsize=UPLOAD_AHEAD)
+        self.results = queue.Queue(maxsize=1024)
+        self.pending = {}
+        self.receipts = {}
+        self.pending_lock = threading.Lock()
+        self.traffic = Traffic()
+        self.transfer_stage = 'idle'
         self.session_id = secrets.token_hex(16)
         self.base = ''
         self.tunnel = None
         self.tunnel_job = None
-        self.sent = self.received = 0
         self.hits = 0
         self.generation = 0
         self.stats = dict(state='disabled')
         self.started = time.monotonic()
         self.thread = threading.Thread(target=self.pulse,daemon=True,name='remote-lease')
         self.upload_thread = threading.Thread(target=self.transfer,daemon=True,name='remote-transfer')
+        self.result_thread = threading.Thread(target=self.receive,daemon=True,name='remote-results')
         self.thread.start()
         self.upload_thread.start()
+        self.result_thread.start()
 
     def http(self):
         token = (self.cfg.data_dir/'remote-token').read_text().strip()
@@ -69,7 +111,7 @@ class Transport:
 
     def request(self, session, method, path, **kwargs):
         response = session.request(method,self.base+path,timeout=(3,15),**kwargs)
-        self.received += len(response.content)
+        self.traffic.add(received=len(response.content))
         if method!='HEAD':
             response.raise_for_status()
         return response
@@ -114,7 +156,6 @@ class Transport:
     def pulse(self):
         http = None
         next_retry = 0
-        previous = (time.monotonic(),0,0)
         try:
             while not self.closed.is_set():
                 enabled = self.active and self.cfg.remote_enabled and self.alive()
@@ -138,11 +179,9 @@ class Transport:
                     self.close_tunnel()
                     self.stats = dict(state='disconnected',error=type(exc).__name__)
                     next_retry = time.monotonic()+5
-                now = time.monotonic()
-                self.stats.update(sent=self.sent,received=self.received,cache_hits=self.hits,
-                    upload_bps=(self.sent-previous[1])/max(.1,now-previous[0]),
-                    download_bps=(self.received-previous[2])/max(.1,now-previous[0]))
-                previous = now,self.sent,self.received
+                self.stats.update(self.traffic.snapshot(),cache_hits=self.hits,
+                    uploading=self.transfer_stage,upload_queue=self.queue.qsize(),
+                    received_queue=self.results.qsize())
                 self.emit(dict(type='remote_status',remote=dict(self.stats)))
                 self.closed.wait(2)
         finally:
@@ -157,16 +196,15 @@ class Transport:
 
     def transfer(self):
         http = None
-        pending = {}
-        cursor = 0
-        generation = self.generation
         try:
             while not self.closed.is_set():
-                if generation != self.generation:
-                    pending.clear()
-                    generation = self.generation
                 if not self.active or not self.cfg.remote_enabled or not self.alive() or not self.connected.wait(.25):
+                    self.transfer_stage = 'idle'
                     self.closed.wait(.1)
+                    continue
+                if self.stats.get('cache_pending_bytes',0) >= self.stats.get('cache_limit',20*1024**3)*.9:
+                    self.transfer_stage = 'cache_full'
+                    self.closed.wait(.5)
                     continue
                 item = None
                 try:
@@ -176,8 +214,10 @@ class Transport:
                     except queue.Empty:
                         item = None
                     if item:
+                        generation = self.generation
                         serial,asset,stages = item
                         try:
+                            self.transfer_stage = 'preparing'
                             blob = prepare(asset,self.cfg)
                             context = {}
                             if 'location' in stages:
@@ -192,31 +232,22 @@ class Transport:
                             key = digest(blob)
                             response = self.request(http,'HEAD','/blobs/'+key)
                             if response.status_code==404:
-                                self.request(http,'PUT','/blobs/'+key,data=blob)
-                                self.sent += len(blob)
+                                self.transfer_stage = 'uploading'
+                                with UploadBody(blob,self.traffic) as body:
+                                    self.request(http,'PUT','/blobs/'+key,data=body)
                             else:
                                 response.raise_for_status()
                                 self.hits += 1
                             if generation != self.generation or not self.active or not self.cfg.remote_enabled:
                                 raise ValueError('Отправка отменена')
                             self.request(http,'POST','/jobs',json=dict(session=self.session_id,blob=key,stages=stages,context=context))
-                            pending[serial] = job_key(key,stages,context)
+                            with self.pending_lock:
+                                if generation==self.generation:
+                                    self.pending[serial] = job_key(key,stages,context)
                         except Exception as exc:
                             self.results.put((serial,None,str(exc)[:300]))
-                    keys = list(pending)
-                    # Interleave result collection with uploads; never wait for
-                    # GPU availability to fill the opaque server input cache.
-                    for serial in (keys+keys)[cursor:cursor+min(8,len(keys))]:
-                        try:
-                            result = self.request(http,'GET','/jobs/'+pending[serial]).json()
-                            if result['status']=='done':
-                                result['result']['key'] = pending[serial]
-                                self.results.put((serial,result['result'],''))
-                                pending.pop(serial,None)
-                        except Exception as exc:
-                            self.results.put((serial,None,str(exc)[:300]))
-                            pending.pop(serial,None)
-                    cursor = (cursor+8)%max(1,len(pending))
+                        finally:
+                            self.transfer_stage = 'idle'
                 except Exception:
                     self.closed.wait(1)
                 if not item:
@@ -225,6 +256,56 @@ class Transport:
             if http:
                 http.close()
 
+    def receive(self):
+        """Results and commit receipts never wait for a RAW decode or upload."""
+        http = None
+        try:
+            while not self.closed.is_set():
+                if not self.active or not self.cfg.remote_enabled or not self.alive() or not self.connected.wait(.25):
+                    self.closed.wait(.2)
+                    continue
+                try:
+                    http = http or self.http()
+                    with self.pending_lock:
+                        receipts = dict(list(self.receipts.items())[:128])
+                        # Server takes FIFO jobs. Older outstanding inputs are
+                        # sufficient, without polling thousands of future jobs.
+                        keys = list(dict.fromkeys(self.pending.values()))[:128]
+                        generation = self.generation
+                    if receipts:
+                        self.request(http,'POST','/receipts',json=dict(session=self.session_id,receipts=receipts))
+                        with self.pending_lock:
+                            for key,value in receipts.items():
+                                if self.receipts.get(key)==value:
+                                    self.receipts.pop(key)
+                    if keys:
+                        response = self.request(http,'POST','/results',json=dict(keys=keys)).json()
+                        for item in response['items']:
+                            result = item['result'] | dict(key=item['key'])
+                            with self.pending_lock:
+                                serials = [s for s,k in self.pending.items() if k==item['key']] if generation==self.generation else []
+                                for serial in serials:
+                                    self.pending.pop(serial)
+                            for serial in serials:
+                                self.results.put((serial,result,''))
+                        for key in response.get('missing',[]):
+                            with self.pending_lock:
+                                serials = [s for s,k in self.pending.items() if k==key] if generation==self.generation else []
+                                for serial in serials:
+                                    self.pending.pop(serial)
+                            for serial in serials:
+                                self.results.put((serial,None,'Вход вытеснен из серверного кэша; будет отправлен снова'))
+                except Exception:
+                    self.closed.wait(1)
+                self.closed.wait(.3)
+        finally:
+            if http:
+                http.close()
+
+    def acknowledge(self, key, receipt):
+        with self.pending_lock:
+            self.receipts[key] = receipt
+
     def close(self):
         self.active = False
         self.closed.set()
@@ -232,7 +313,10 @@ class Transport:
         # Watchdog expiry remains the fallback if the network is gone.
 
     def cancel(self):
-        self.generation += 1
+        with self.pending_lock:
+            self.generation += 1
+            self.pending.clear()
+            self.receipts.clear()
         while True:
             try:
                 self.queue.get_nowait()

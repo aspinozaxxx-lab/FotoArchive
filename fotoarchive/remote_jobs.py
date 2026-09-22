@@ -8,19 +8,28 @@ import time
 import numpy as np
 from PIL import Image
 from .remote_client import Transport
+from .remote_protocol import MAX_PENDING
 
 
 def claim_bundle(catalog, excluded=()):
     db = catalog.db
     skip = ' AND a.id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
-    row = db.execute('''SELECT a.id FROM assets a WHERE a.present=1 AND a.metadata_ready=1
-        AND EXISTS(SELECT 1 FROM jobs j WHERE j.asset_id=a.id AND j.file_version=a.version
-            AND j.stage IN ('embedding','faces','caption','location') AND j.status='pending')
-        AND NOT EXISTS(SELECT 1 FROM jobs j WHERE j.asset_id=a.id AND j.status='running')'''+skip+
-        ' ORDER BY a.id DESC LIMIT 1',list(excluded)).fetchone()
-    if not row:
+    # One ordered index seek per stage avoids sorting the entire archive for
+    # every input. The separate asset/status index makes overlap checks cheap
+    # even when thousands of remote jobs are already reserved.
+    candidates=[]
+    sql='''SELECT j.asset_id FROM jobs j INDEXED BY jobs_ready JOIN assets a ON a.id=j.asset_id
+        WHERE j.status='pending' AND j.stage=? AND j.file_version=a.version
+        AND a.present=1 AND a.metadata_ready=1
+        AND NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.asset_id=a.id AND busy.status='running')'''+skip+'''
+        ORDER BY j.asset_id DESC LIMIT 1'''
+    for stage in ('embedding','faces','caption','location'):
+        row=db.execute(sql,[stage,*excluded]).fetchone()
+        if row:
+            candidates.append(row[0])
+    if not candidates:
         return None
-    asset = catalog.get(row[0])
+    asset = catalog.get(max(candidates))
     jobs = []
     with db:
         if asset['media_kind']=='video':
@@ -71,10 +80,11 @@ class RemoteJobs:
     def __init__(self, engine, alive):
         self.engine, self.catalog = engine, engine.catalog
         self.pending = {}
-        self.excluded = set()
+        self.excluded = {}
         self.serial = 0
         self.retry_at = 0
         self.next_fill = 0
+        self.last_error = ''
         self.catalog.db.execute('''CREATE TABLE IF NOT EXISTS remote_runs(
             asset_id INTEGER,file_version INTEGER,unit_id TEXT,stage TEXT,model_version TEXT,
             job_key TEXT,provider TEXT,elapsed REAL,PRIMARY KEY(asset_id,file_version,unit_id,stage))''')
@@ -87,8 +97,15 @@ class RemoteJobs:
     def fill(self):
         if not self.engine.cfg.remote_enabled or not self.transport.active or not self.transport.connected.is_set() or time.monotonic()<max(self.retry_at,self.next_fill):
             return
-        # Two claims per owner tick keeps large catalogue interaction responsive.
-        for _ in range(min(2,128-len(self.pending))):
+        now = time.monotonic()
+        self.excluded = {asset_id:until for asset_id,until in self.excluded.items() if until>now}
+        # Fill a useful reserve before the next slow local GPU call, while
+        # bounding both coordinator latency and prepared metadata in memory.
+        deadline = time.monotonic()+.015
+        slots = min(16,MAX_PENDING-len(self.pending),self.transport.queue.maxsize-self.transport.queue.qsize())
+        for _ in range(slots):
+            if time.monotonic()>=deadline:
+                break
             bundle = claim_bundle(self.catalog,self.excluded)
             if not bundle:
                 self.next_fill = time.monotonic()+3
@@ -100,7 +117,10 @@ class RemoteJobs:
 
     def collect(self):
         completed = 0
-        for _ in range(8):
+        deadline = time.monotonic()+.025
+        for _ in range(32):
+            if time.monotonic()>=deadline:
+                break
             try:
                 serial,result,error = self.transport.results.get_nowait()
             except queue.Empty:
@@ -109,6 +129,7 @@ class RemoteJobs:
             if not bundle:
                 continue
             asset,jobs = bundle
+            receipt = 'saved'
             try:
                 if error:
                     raise ValueError(error)
@@ -117,6 +138,7 @@ class RemoteJobs:
                     raise ValueError('Исходный файл изменился')
                 for job in jobs:
                     if not self.catalog.current_job(job):
+                        receipt = 'discarded'
                         continue
                     # Interactive face recognition may have finished this stage
                     # while the same input was travelling to the server.
@@ -125,11 +147,15 @@ class RemoteJobs:
                     else:
                         row = self.catalog.db.execute('SELECT status FROM jobs WHERE asset_id=? AND stage=? AND file_version=?',(job['asset_id'],job['stage'],job['file_version'])).fetchone()
                     if not row or row[0]!='running':
+                        if not row or row[0]!='done':
+                            receipt = 'discarded'
                         continue
                     stage = job['stage']
                     if stage not in result['stages']:
+                        receipt = 'partial'
                         self.catalog.requeue_jobs([job])
-                        self.excluded.add(asset['id'])
+                        self.defer(asset['id'])
+                        self.engine.metrics.record(job,result.get('errors',{}).get(stage,'Неполный результат'),'remote')
                         continue
                     value = result['stages'][stage]
                     if stage=='embedding':
@@ -146,18 +172,29 @@ class RemoteJobs:
                         if bool(location['geo_text']) != (geo_vector is not None):
                             raise ValueError('Неполный результат обработки места')
                         self.catalog.complete_location(job,location,geo_vector)
-                    self.catalog.finish_job(job,result['elapsed'])
+                    self.catalog.finish_job(job,result['elapsed'],source='remote')
                     with self.catalog.db:
                         self.catalog.db.execute('INSERT OR REPLACE INTO remote_runs VALUES(?,?,?,?,?,?,?,?)',
                             (asset['id'],asset['version'],job.get('unit_id',''),stage,job['model_version'],result['key'],json.dumps(result['providers'].get(stage)),result['elapsed']))
                     completed += 1
             except Exception as exc:
+                receipt = 'discarded'
                 self.catalog.requeue_jobs(jobs)
-                self.retry_at = time.monotonic()+60
+                # One changed/unreadable input must not stop refilling the
+                # entire server for a minute. Network retries live in Transport.
+                self.defer(asset['id'])
+                self.last_error = str(exc)[:300]
                 self.engine.emit(dict(type='remote_notice',message=str(exc)[:300]))
+            if result and result.get('key'):
+                self.transport.acknowledge(result['key'],receipt)
         if completed:
             self.engine.flush_progress(completed)
         return completed
+
+    def defer(self, asset_id):
+        self.excluded[asset_id] = time.monotonic()+60
+        while len(self.excluded)>2048:
+            self.excluded.pop(next(iter(self.excluded)))
 
     def close(self):
         self.transport.close()
@@ -165,6 +202,7 @@ class RemoteJobs:
 
     def cancel(self):
         self.transport.cancel()
-        for _,jobs in self.pending.values():
-            self.catalog.requeue_jobs(jobs)
+        # A large pre-upload reserve must not mean thousands of commits when
+        # disabling the server or closing the application.
+        self.catalog.requeue_jobs([job for _,jobs in self.pending.values() for job in jobs])
         self.pending.clear()

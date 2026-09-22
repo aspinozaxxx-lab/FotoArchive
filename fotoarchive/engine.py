@@ -43,6 +43,9 @@ class Engine:
         self.face_models = None
         self.places = None
         self.processed_since_flush = 0
+        from .processing_metrics import ProcessingMetrics
+        self.metrics = ProcessingMetrics()
+        self.catalog.on_job_finished = self.metrics.record
         from .pipeline import ProcessingPipeline
         self.pipeline = ProcessingPipeline(self)
 
@@ -637,6 +640,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                 maintenance_needed = False
             if time.monotonic() - last_status > 1:
                 emit({"type": "status", "stats": engine.catalog.stats(), "paused": paused,
+                      "processing_metrics":engine.metrics.snapshot(),
                       "local_enabled":cfg.local_enabled,"remote_enabled":cfg.remote_enabled,
                       "scanning":pipeline.scanning, "scan":pipeline.scan_state,"pipeline":pipeline.status(),
                       "inventory": pipeline.inventory.status()})

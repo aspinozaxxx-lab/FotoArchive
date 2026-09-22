@@ -158,6 +158,7 @@ class Catalog:
           error TEXT, elapsed REAL, PRIMARY KEY(asset_id,stage)
         );
         CREATE INDEX IF NOT EXISTS jobs_ready ON jobs(status,stage,asset_id);
+        CREATE INDEX IF NOT EXISTS jobs_asset_status ON jobs(asset_id,status);
         CREATE TABLE IF NOT EXISTS outbox(unit_id TEXT PRIMARY KEY, revision INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS verification_cache(
           cache_key TEXT PRIMARY KEY, asset_id INTEGER NOT NULL, file_version INTEGER NOT NULL,
@@ -424,14 +425,25 @@ class Catalog:
         unit = self.db.execute('SELECT u.id unit_id,u.timestamp_ms FROM face_units f JOIN units u ON u.id=f.unit_id WHERE f.face_id=?', (face_id,)).fetchone()
         return result | (dict(unit) if unit else {})
 
-    def finish_job(self, job, elapsed, error=None):
+    def finish_job(self, job, elapsed, error=None, source='local'):
         if not self.current_job(job):
             return
+        observer = getattr(self, 'on_job_finished', None)
+        previous = None
+        if observer:
+            if job.get('unit_id'):
+                previous = self.db.execute('SELECT status FROM unit_jobs WHERE unit_id=? AND stage=? AND file_version=?',
+                    (job['unit_id'],job['stage'],job['file_version'])).fetchone()
+            else:
+                previous = self.db.execute('SELECT status FROM jobs WHERE asset_id=? AND stage=? AND file_version=?',
+                    (job['asset_id'],job['stage'],job['file_version'])).fetchone()
         with self.db:
             if job.get('unit_id'):
                 self.media_units.finish(job, elapsed, error)
-                return
-            self.db.execute("UPDATE jobs SET status=?,error=?,elapsed=? WHERE asset_id=? AND stage=? AND file_version=?", ("error" if error else "done", error, elapsed, job["asset_id"], job["stage"], job["file_version"]))
+            else:
+                self.db.execute("UPDATE jobs SET status=?,error=?,elapsed=? WHERE asset_id=? AND stage=? AND file_version=?", ("error" if error else "done", error, elapsed, job["asset_id"], job["stage"], job["file_version"]))
+        if observer and previous and previous[0] != ('error' if error else 'done'):
+            observer(job, error, source)
 
     def requeue_jobs(self, jobs):
         with self.db:
