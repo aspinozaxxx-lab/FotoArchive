@@ -17,6 +17,15 @@ from .remote_protocol import unpack
 from .remote_exec import die_with_parent
 
 
+def record_stage_error(output, stage, exc):
+    output['stages'].pop(stage, None)
+    output['errors'][stage] = str(exc)[:500]
+    # Invalid/truncated model output is specific to this input, not evidence
+    # of a broken CUDA process. Infrastructure errors still recycle the owner.
+    if not isinstance(exc, ValueError):
+        output['restart_worker'] = True
+
+
 class CudaVision(VisionLanguage):
     def _start(self):
         if self.process and self.process.poll() is None:
@@ -136,8 +145,7 @@ def main():
                         output['stages'][stage] = dict(location=location,vector=geo_vector)
                         output['providers'][stage] = 'CUDAExecutionProvider' if text else 'metadata'
                 except Exception as exc:
-                    output['stages'].pop(stage,None)
-                    output['errors'][stage] = str(exc)[:500]
+                    record_stage_error(output,stage,exc)
         except Exception as exc:
             output['errors'] = {stage:str(exc)[:500] for stage in job['stages']}
         output['elapsed'] = time.monotonic()-started

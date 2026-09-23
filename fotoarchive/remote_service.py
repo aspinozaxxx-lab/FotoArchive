@@ -59,6 +59,8 @@ class Supervisor:
         self.last_error = ''
         self.retry_at = 0
         self.completions = deque(maxlen=10000)
+        self.wake = threading.Event()
+        self.next_probe = 0
 
     def lease(self, session, active):
         if not isinstance(session,str) or not 16 <= len(session) <= 80 or not isinstance(active,bool):
@@ -69,6 +71,7 @@ class Supervisor:
             self.session = session
             self.store.active_session = session if active else ''
             self.deadline = self.clock()+LEASE_SECONDS if active else 0
+            self.wake.set()
             if not active:
                 self.stop()
                 self.state = 'paused'
@@ -82,6 +85,7 @@ class Supervisor:
         while self.completions and self.completions[0]<=self.clock()-60:
             self.completions.popleft()
         return dict(state=self.state,gpu=self.gpu,lease_seconds=LEASE_SECONDS,error=self.last_error,
+                    current_stages=list(self.current['stages']) if self.current else [],
                     rate=len(self.completions),**self.store.stats(self.session))
 
     def start(self):
@@ -99,6 +103,7 @@ class Supervisor:
                 if line.startswith('RESULT\t'):
                     try:
                         self.messages.put((process.pid,json.loads(line[7:])),timeout=1)
+                        self.wake.set()
                     except (ValueError,queue.Full):
                         pass
         threading.Thread(target=read,daemon=True).start()
@@ -115,6 +120,7 @@ class Supervisor:
             self.worker.stdin.close()
             self.worker = None
         self.current = None
+        self.next_probe = 0
         self.store.reset()
 
     def tick(self):
@@ -127,7 +133,9 @@ class Supervisor:
                 self.state = 'disconnected'
                 return
             try:
-                self.gpu = self.probe(self.worker.pid if self.worker else None,self.passive_pids)
+                if now>=self.next_probe:
+                    self.gpu = self.probe(self.worker.pid if self.worker else None,self.passive_pids)
+                    self.next_probe = now+1
             except Exception:
                 self.stop()
                 self.state = 'gpu_unavailable'
@@ -150,7 +158,7 @@ class Supervisor:
                     self.completed += bool(result.get('stages'))
                     self.idle_since = now
                     self.last_error = '; '.join(result.get('errors',{}).values())[:500]
-                    if result.get('errors') and not result.get('stages'):
+                    if result.get('restart_worker'):
                         self.stop()
                         self.retry_at = now+60
             if now < self.retry_at:
@@ -214,6 +222,7 @@ def serve(supervisor, token, host='127.0.0.1', port=18765):
                     with supervisor.lock:
                         supervisor.require_lease(body['session'])
                         key = supervisor.store.submit(body['session'],body['blob'],body['stages'],body.get('context'))
+                        supervisor.wake.set()
                     result = dict(key=key)
                 elif self.command=='GET' and len(path)==2 and path[0]=='jobs':
                     result = supervisor.store.result(path[1])
@@ -250,6 +259,7 @@ def main():
     server = serve(supervisor,Path(args.token_file).read_text().strip())
     def watchdog():
         while True:
+            supervisor.wake.clear()
             try:
                 supervisor.tick()
             except Exception as exc:
@@ -257,7 +267,9 @@ def main():
                     supervisor.stop()
                     supervisor.retry_at = time.monotonic()+60
                     supervisor.last_error = type(exc).__name__
-            time.sleep(1)
+            # Results and incoming jobs immediately wake the dispatcher. GPU
+            # ownership and lease expiry are still checked at least once/sec.
+            supervisor.wake.wait(1)
     threading.Thread(target=watchdog,daemon=True).start()
     try:
         server.serve_forever(poll_interval=.5)

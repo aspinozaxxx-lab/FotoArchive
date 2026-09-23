@@ -80,11 +80,14 @@ class Store:
     def trim(self, extra=0):
         total = self.db.execute('SELECT coalesce(sum(size),0) FROM blobs').fetchone()[0]
         total += self.db.execute('SELECT coalesce(sum(length(result)),0) FROM jobs').fetchone()[0]
+        # Retire a useful batch instead of oscillating at 100% for every photo.
+        # A large active reserve remains protected even above the low watermark.
+        target = int(self.budget*.85) if total+extra>self.budget*.95 else self.budget
         # Active queued inputs and results awaiting catalogue confirmation must
         # survive eviction. Expired sessions can reconstruct their queue.
         pinned = "j.status='running' OR (j.session=? AND (j.status='queued' OR (j.status='done' AND j.ack_session!=j.session)))"
         for row in self.db.execute(f"SELECT * FROM blobs b WHERE NOT EXISTS (SELECT 1 FROM jobs j WHERE j.blob=b.id AND ({pinned})) ORDER BY used",(self.active_session,)).fetchall():
-            if total+extra <= self.budget:
+            if total+extra <= target:
                 break
             self.path(row['id']).unlink(missing_ok=True)
             result_bytes = self.db.execute('SELECT coalesce(sum(length(result)),0) FROM jobs WHERE blob=?',(row['id'],)).fetchone()[0]
@@ -200,6 +203,9 @@ class Store:
             pinned = self.db.execute("""SELECT coalesce(sum(size),0) FROM blobs b WHERE EXISTS(
                 SELECT 1 FROM jobs j WHERE j.blob=b.id AND (j.status='running' OR
                 (j.session=? AND (j.status='queued' OR (j.status='done' AND j.ack_session!=j.session)))))""",(session,)).fetchone()[0]
+            pinned += self.db.execute("""SELECT coalesce(sum(length(result)),0) FROM jobs j
+                WHERE j.status='running' OR (j.session=? AND j.status='done' AND j.ack_session!=j.session)""",(session,)).fetchone()[0]
             return dict(queued=counts.get('queued',0),running=counts.get('running',0),completed=totals['completed'],
                 partial=totals['partial'],failed=totals['failed'],saved=totals['saved'],awaiting_save=waiting,discarded=totals['discarded'],
-                cache_bytes=size+results,cache_limit=self.budget,cache_pending_bytes=pinned)
+                cache_bytes=size+results,cache_limit=self.budget,cache_pending_bytes=pinned,
+                cache_reusable_bytes=max(0,size+results-pinned))

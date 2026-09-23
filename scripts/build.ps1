@@ -16,7 +16,7 @@ try {
         New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
         Copy-Item -LiteralPath 'build\FotoArchive\FotoArchive.exe' -Destination (Join-Path $bundleDir 'FotoArchive.exe')
     }
-    foreach ($document in @('VALIDATION.md', 'VALIDATION-v064.md', 'VALIDATION-v070.md', 'VALIDATION-v071.md', 'VALIDATION-v072.md', 'VALIDATION-v080.md', 'VALIDATION-v081.md', 'VALIDATION-v082.md', 'VALIDATION-v083.md', 'CATALOG-v070.md', 'README.md', 'requirements.lock')) {
+    foreach ($document in @('VALIDATION.md', 'VALIDATION-v064.md', 'VALIDATION-v070.md', 'VALIDATION-v071.md', 'VALIDATION-v072.md', 'VALIDATION-v080.md', 'VALIDATION-v081.md', 'VALIDATION-v082.md', 'VALIDATION-v083.md', 'VALIDATION-v084.md', 'CATALOG-v070.md', 'README.md', 'requirements.lock')) {
         if (Test-Path -LiteralPath $document) { Copy-Item -LiteralPath $document -Destination (Join-Path $bundleDir $document) }
     }
 } finally {
