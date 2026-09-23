@@ -48,7 +48,6 @@ def run(folder, repeats=5):
     from .config import Settings
     from .telegram_share import Contacts, TelegramDraft
     from .ui import Viewer
-    from .video_player import VideoPlayerDialog
 
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
@@ -90,14 +89,15 @@ def run(folder, repeats=5):
             for kind in ('video-close-playing', 'video-close-at-end', 'photo-close', 'photo-escape'):
                 path = clip if kind.startswith('video') else photo
                 asset = dict(id=1, version=1, path=str(path), filename=path.name,
-                             width=160 if kind.startswith('video') else 640, height=96)
-                viewer = (VideoPlayerDialog(asset, cfg) if kind.startswith('video')
-                          else Viewer([asset], 0, cfg))
+                             width=160 if kind.startswith('video') else 640, height=96,
+                             media_kind='video' if kind.startswith('video') else 'image')
+                viewer = Viewer([asset], 0, cfg)
                 viewer.setWindowTitle('FotoArchive — проверка закрытия просмотра')
                 viewer.show()
                 if kind.startswith('video'):
-                    viewer.audio.setMuted(True)
-                    pump_until(lambda: viewer.player.duration() > 0)
+                    player = viewer.video_pane.player
+                    viewer.video_pane.audio.setMuted(True)
+                    pump_until(lambda: player.duration() > 0)
                 else:
                     pump_until(lambda: bool(viewer.scene.items()))
                 button = viewer.share_button
@@ -115,7 +115,7 @@ def run(folder, repeats=5):
                 if kind == 'video-close-at-end':
                     # The reported deadlock also happens at EOF without a close
                     # click: FFmpeg releases its decoder threads inside the menu.
-                    pump_until(lambda: viewer.player.mediaStatus() == QMediaPlayer.EndOfMedia)
+                    pump_until(lambda: player.mediaStatus() == QMediaPlayer.EndOfMedia)
                     assert button.menu.isVisible()
                 close_at = time.perf_counter()
                 if kind == 'photo-escape':
@@ -127,8 +127,8 @@ def run(folder, repeats=5):
                 assert not button.menu.isVisible() and not button.hover.isActive()
                 assert button.stop.is_set()
                 if kind.startswith('video'):
-                    assert viewer.player.playbackState() == QMediaPlayer.StoppedState
-                    assert viewer.player.source().isEmpty()
+                    assert player.playbackState() == QMediaPlayer.StoppedState
+                    assert player.source().isEmpty()
                 report['checks'].append(dict(case=kind, repeat=repeat, open_ms=round(open_ms, 2),
                                              close_ms=round((time.perf_counter()-close_at)*1000, 2)))
                 viewer.deleteLater()

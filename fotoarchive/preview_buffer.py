@@ -55,8 +55,8 @@ class PreviewBuffer(QObject):
         return None
 
     def prepare(self, current, neighbours):
-        self.current = preview_key(current)
-        self.wanted = [current, *neighbours]
+        self.current = preview_key(current) if current else None
+        self.wanted = ([current] if current else []) + list(neighbours)
         wanted = {preview_key(asset) for asset in self.wanted}
         for key in list(self.cache):
             if key not in wanted:

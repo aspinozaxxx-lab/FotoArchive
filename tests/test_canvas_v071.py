@@ -111,14 +111,17 @@ def test_named_chip_refines_only_that_person_and_preserves_group(qtbot,tmp_path,
 
 
 def test_video_card_opens_clicked_frame_without_other_frame_evidence(qtbot,tmp_path,monkeypatch):
-    from fotoarchive.video_player import VideoPlayerDialog
+    from types import SimpleNamespace
     from PySide6.QtGui import QFontMetrics
     opened=[]
     class Player:
-        def __init__(self,asset,*args): opened.append(asset)
+        personSelected=SimpleNamespace(connect=lambda *_:None)
+        def __init__(self,items,position,*args,initial_asset=None):
+            opened.append(initial_asset)
+            assert items is w.model and position==0
         def exec(self): pass
         def deleteLater(self): pass
-    monkeypatch.setattr('fotoarchive.video_player.VideoPlayerDialog',Player)
+    monkeypatch.setattr('fotoarchive.ui.Viewer',Player)
     w=MainWindow(Settings(data_dir=tmp_path),FakeBackend())
     qtbot.addWidget(w)
     w.show()

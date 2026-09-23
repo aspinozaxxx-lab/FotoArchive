@@ -16,7 +16,8 @@ from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPainterPath, QPen, Q
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDateEdit, QDialog, QDoubleSpinBox,
     QFileDialog, QFormLayout, QFrame, QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QHBoxLayout,
     QLabel, QLayout, QLineEdit, QListView, QMainWindow, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSpinBox, QSplitter, QStyledItemDelegate, QTextBrowser, QVBoxLayout, QWidget, QSlider, QButtonGroup)
+    QSpinBox, QSplitter, QStyledItemDelegate, QTextBrowser, QVBoxLayout, QWidget, QSlider, QButtonGroup,
+    QStackedWidget, QSizePolicy)
 
 from .catalog import Filters
 from .config import Settings
@@ -183,11 +184,14 @@ class PreviewTask(QRunnable):
 class Viewer(QDialog):
     personSelected = Signal(str)
 
-    def __init__(self, items, position, cfg, parent=None, backend=None):
+    def __init__(self, items, position, cfg, parent=None, backend=None, *, frame_only=False, initial_asset=None):
         super().__init__(parent)
         self.items, self.position, self.cfg = items, position, cfg
         self.backend = backend
         self.asset = None
+        self.frame_only = frame_only
+        self.playing_video = False
+        self.video_pane = None
         self.faces = []
         self.box_owner = parent
         while self.box_owner and not hasattr(self.box_owner, "faceBoxesChanged"):
@@ -200,6 +204,7 @@ class Viewer(QDialog):
             backend.event.connect(self.on_event)
         if isinstance(items, PhotoModel):
             items.assetsReady.connect(self.assets_ready)
+            items.countChanged.connect(self.update_navigation)
         self.load_token = 0
         self.original_loaded = False
         self.pool = QThreadPool.globalInstance()
@@ -208,7 +213,7 @@ class Viewer(QDialog):
         self.preview_buffer.ready.connect(self.buffer_ready)
         self.preview_signals = PreviewSignals()
         self.preview_signals.ready.connect(self.loaded)
-        self.setWindowTitle("Просмотр фотографии")
+        self.setWindowTitle("Просмотр фото и видео")
         self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         self.resize(1200, 820)
         layout = QVBoxLayout(self)
@@ -241,34 +246,87 @@ class Viewer(QDialog):
         if self.box_owner:
             self.box_owner.faceBoxesChanged.connect(self.apply_face_boxes)
         layout.addLayout(top)
+        self.media_stack = QStackedWidget()
+        # A movie's decoded dimensions and changing controls must never resize
+        # the top-level window, including after a move between monitors.
+        self.media_stack.setSizePolicy(QSizePolicy.Ignored,QSizePolicy.Ignored)
+        layout.addWidget(self.media_stack,1)
+        self.image_page = QWidget()
+        image_layout = QVBoxLayout(self.image_page)
+        image_layout.setContentsMargins(0,0,0,0)
+        self.media_stack.addWidget(self.image_page)
         self.scene = QGraphicsScene(self)
         self.view = ZoomView(self.scene)
         self.view.zoomed.connect(self.manual_zoom)
         self.view.setBackgroundBrush(QColor("#17232a"))
         self.view.setDragMode(QGraphicsView.ScrollHandDrag)
-        layout.addWidget(self.view)
+        image_layout.addWidget(self.view,1)
+        hint_row = QHBoxLayout()
         hint = QLabel("Прокрутка — увеличение · перетаскивание — перемещение · нажатие на лицо — поиск или ещё один пример выбранного человека")
         hint.setObjectName("muted")
-        layout.addWidget(hint)
+        hint.setWordWrap(True)
+        hint_row.addWidget(hint,1)
+        self.resume_video_button = QPushButton('Воспроизвести видео')
+        self.resume_video_button.clicked.connect(lambda:self.load(asset=self.asset))
+        self.resume_video_button.hide()
+        hint_row.addWidget(self.resume_video_button)
+        image_layout.addLayout(hint_row)
         QShortcut(QKeySequence(Qt.Key_Left), self, activated=lambda: self.navigate(-1))
         QShortcut(QKeySequence(Qt.Key_Right), self, activated=lambda: self.navigate(1))
-        self.load()
+        self.load(asset=initial_asset)
 
-    def load(self, original=False):
-        self.asset = self.items.asset(self.position) if isinstance(self.items, PhotoModel) else self.items[self.position]
+    def load(self, original=False, asset=None, still_frame=False):
+        if self.finished_cleanup:
+            return
+        if self.video_pane:
+            self.video_pane.stop()
+        # Close a hover menu from the previous file without cancelling the
+        # reusable share button or a file already explicitly chosen for sharing.
+        self.share_button.hover.stop()
+        self.share_button.menu.close()
+        self.asset = asset or (self.asset if original else
+            self.items.asset(self.position) if isinstance(self.items, PhotoModel) else self.items[self.position])
         self.load_token += 1
         self.original_loaded = False
         self.loading_original = original
         self.faces = []
+        self.playing_video = bool(self.asset and self.asset.get('media_kind')=='video'
+                                  and not (self.frame_only or still_frame or original))
+        for name in ('fit','actual'):
+            self.controls[name].setEnabled(bool(self.asset) and not self.playing_video)
+        self.controls['original'].setEnabled(bool(self.asset))
+        self.face_boxes_check.setEnabled(bool(self.asset) and not self.playing_video)
+        self.share_button.setVisible(bool(self.asset))
+        self.resume_video_button.setVisible(bool(self.asset and self.asset.get('media_kind')=='video'
+                                                and not self.frame_only and not self.playing_video))
         for item in self.scene.items():
             if isinstance(item, FaceBox):
                 self.scene.removeItem(item)
         if not self.asset:
             self.waiting = True
             self.label.setText("Загрузка следующей части каталога…")
+            self.scene.clear()
+            self.media_stack.setCurrentWidget(self.image_page)
+            self.update_navigation()
+            if isinstance(self.items, PhotoModel):
+                self.items.request_page(self.position)
             return
         self.waiting = False
         self.label.setText(self.caption_text())
+        self.update_navigation()
+        if self.playing_video:
+            if self.video_pane is None:
+                from .video_player import VideoPane
+                self.video_pane = VideoPane(self.cfg,self,self.backend)
+                self.video_pane.frameRequested.connect(self.show_video_frame)
+                self.video_pane.assetChanged.connect(self.video_asset_changed)
+                self.media_stack.addWidget(self.video_pane)
+            self.scene.clear()
+            self.media_stack.setCurrentWidget(self.video_pane)
+            self.video_pane.load(self.asset)
+            self.prefetch()
+            return
+        self.media_stack.setCurrentWidget(self.image_page)
         if original:
             self.pool.start(PreviewTask(self.load_token, self.asset, self.cfg, True, self.preview_signals), 100)
         else:
@@ -286,8 +344,23 @@ class Viewer(QDialog):
         if self.backend:
             self.backend.send(action="faces", asset_id=self.asset["id"], unit_id=self.asset.get('unit_id'))
 
+    def show_video_frame(self):
+        if self.video_pane and self.asset:
+            self.load(asset=self.video_pane.asset,still_frame=True)
+
+    def video_asset_changed(self,asset):
+        if not self.finished_cleanup and self.playing_video:
+            self.asset = asset
+            self.label.setText(self.caption_text())
+
+    def more_moments(self):
+        if not self.finished_cleanup and self.playing_video and self.video_pane:
+            self.video_pane.more_moments()
+
     def assets_ready(self, start, end):
-        if self.waiting and start <= self.position <= end:
+        if self.waiting:
+            # An earlier request may have occupied every bounded page slot.
+            # Any arrival frees a slot for the page the viewer is waiting for.
             self.load()
         elif not self.finished_cleanup and self.asset:
             self.prefetch()
@@ -297,19 +370,19 @@ class Viewer(QDialog):
         neighbours = []
         for row in [*range(self.position+1, min(count, self.position+6)), *range(self.position-1,max(-1,self.position-6),-1)]:
             asset = self.items.asset(row) if isinstance(self.items, PhotoModel) else self.items[row]
-            if asset:
+            if asset and asset.get('media_kind')!='video':
                 neighbours.append(asset)
-        self.preview_buffer.prepare(self.asset, neighbours)
+        self.preview_buffer.prepare(None if self.playing_video else self.asset, neighbours)
         if isinstance(self.items, PhotoModel) and self.position+5 >= count and self.items.canFetchMore():
             self.items.fetchMore()
 
     def buffer_ready(self, key, image, error):
         from .preview_buffer import preview_key
-        if not self.finished_cleanup and not self.loading_original and self.asset and preview_key(self.asset) == key:
+        if not self.finished_cleanup and not self.playing_video and not self.loading_original and self.asset and preview_key(self.asset) == key:
             self.loaded(self.load_token, image, error, False)
 
     def on_event(self, event):
-        if event["type"] == "face_list" and self.asset and (event["asset_id"], event["version"]) == (self.asset["id"], self.asset["version"]):
+        if event["type"] == "face_list" and not self.playing_video and self.asset and (event["asset_id"], event["version"]) == (self.asset["id"], self.asset["version"]):
             if event.get('unit_id') != self.asset.get('unit_id'):
                 return
             self.faces = event["faces"]
@@ -345,7 +418,7 @@ class Viewer(QDialog):
         self.personSelected.emit(face_id)
 
     def loaded(self, token, image, error, original):
-        if token != self.load_token or self.finished_cleanup:
+        if token != self.load_token or self.finished_cleanup or self.playing_video:
             return
         if error:
             self.label.setText(f"Оригинал недоступен: {error}")
@@ -362,15 +435,22 @@ class Viewer(QDialog):
             self.fit()
 
     def navigate(self, step):
+        if self.finished_cleanup or (self.waiting and step>0):
+            return
         position = self.position + step
-        count = self.items.rowCount() if isinstance(self.items, PhotoModel) else len(self.items)
-        if 0 <= position < count:
+        count = self.items.known_total if isinstance(self.items, PhotoModel) else len(self.items)
+        more = isinstance(self.items,PhotoModel) and position==self.items.rowCount() and self.items.has_more
+        if 0 <= position < count or more:
             self.position = position
             self.load()
-        elif position == count and isinstance(self.items, PhotoModel) and self.items.canFetchMore():
-            self.position = position
-            self.load()
-            self.items.fetchMore()
+
+    def update_navigation(self):
+        if not hasattr(self,'controls'):
+            return
+        count = self.items.known_total if isinstance(self.items,PhotoModel) else len(self.items)
+        more = isinstance(self.items,PhotoModel) and self.items.has_more
+        self.controls['previous'].setEnabled(self.position>0)
+        self.controls['next'].setEnabled(not self.waiting and (self.position+1<count or more))
 
     def caption_text(self):
         from datetime import datetime
@@ -380,7 +460,7 @@ class Viewer(QDialog):
             date='Дата неизвестна'
         text=f"{self.position + 1} · {self.asset['filename']} · {date}"
         if self.asset.get('media_kind')=='video':
-            text+=' · кадр '+timestamp_text(self.asset.get('timestamp_ms'))
+            text+=' · видео' if self.playing_video else ' · кадр '+timestamp_text(self.asset.get('timestamp_ms'))
         return text
 
     def fit(self):
@@ -417,6 +497,8 @@ class Viewer(QDialog):
 
     def done(self, result):
         self.share_button.cancel()
+        if self.video_pane:
+            self.video_pane.stop()
         if not self.finished_cleanup:
             self.finished_cleanup = True
             self.preview_buffer.close()
@@ -424,6 +506,7 @@ class Viewer(QDialog):
                 self.backend.event.disconnect(self.on_event)
             if isinstance(self.items, PhotoModel):
                 self.items.assetsReady.disconnect(self.assets_ready)
+                self.items.countChanged.disconnect(self.update_navigation)
             if self.box_owner:
                 self.box_owner.faceBoxesChanged.disconnect(self.apply_face_boxes)
         super().done(result)
@@ -1298,18 +1381,19 @@ class MainWindow(Workspace, QMainWindow):
 
     def view_photo(self, index):
         if index.isValid():
-            asset = index.data(PhotoModel.AssetRole)
-            if asset and asset.get('media_kind') == 'video':
-                self.open_video_moment(asset)
-                return
             viewer = Viewer(self.model, index.row(), self.cfg, self, self.backend)
             viewer.personSelected.connect(self.find_person)
             viewer.exec()
+            viewer.deleteLater()
 
     def open_video_moment(self, asset, moment=False):
-        from .video_player import VideoPlayerDialog
         from .video import asset_at_moment
-        player = VideoPlayerDialog(asset_at_moment(asset,moment) if moment else asset, self.cfg, self, self.backend)
+        row = next((offset+i for offset,items in self.model.blocks.items()
+                    for i,item in enumerate(items) if item['id']==asset['id']),None)
+        selected = asset_at_moment(asset,moment) if moment else asset
+        player = Viewer(self.model if row is not None else [asset],row if row is not None else 0,
+                        self.cfg,self,self.backend,initial_asset=selected)
+        player.personSelected.connect(self.find_person)
         if moment is None:
             QTimer.singleShot(0,player.more_moments)
         player.exec()
