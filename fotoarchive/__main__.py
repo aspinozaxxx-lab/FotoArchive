@@ -15,7 +15,12 @@ def main():
     parser.add_argument("--analyze-orientation", action="store_true", help="Start/resume recommendations for the already indexed photos")
     parser.add_argument('--map-smoke-test',action='store_true')
     parser.add_argument('--map-offline',action='store_true')
+    parser.add_argument('--playback-smoke-test', action='store_true', help='Check photo/video sharing menu and closing with isolated generated media')
     args = parser.parse_args()
+    if args.playback_smoke_test:
+        if not args.data_dir:parser.error('--playback-smoke-test requires an isolated --data-dir')
+        from .playback_smoke import run
+        return run(Path(args.data_dir))
     if args.map_smoke_test:
         if not args.data_dir:parser.error('--map-smoke-test requires --data-dir')
         from .map_smoke import run

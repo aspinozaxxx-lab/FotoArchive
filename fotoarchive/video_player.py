@@ -183,6 +183,7 @@ class VideoPlayerDialog(QDialog):
         viewer.deleteLater()
 
     def done(self, result):
+        self.share_button.cancel()
         self.player.stop()
         self.player.setSource(QUrl())
         super().done(result)

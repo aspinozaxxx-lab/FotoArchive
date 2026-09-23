@@ -8,7 +8,7 @@ import threading
 import time
 from urllib.parse import urlencode
 
-from PySide6.QtCore import QObject,QRunnable,QThreadPool,QTimer,Signal
+from PySide6.QtCore import QObject,QPoint,QRunnable,QThreadPool,QTimer,Signal
 from PySide6.QtWidgets import QHBoxLayout,QInputDialog,QMenu,QMessageBox,QPushButton,QToolButton,QWidget,QWidgetAction
 
 
@@ -177,18 +177,45 @@ class ShareButton(QToolButton):
     def __init__(self,cfg,asset_provider,parent=None):
         super().__init__(parent);self.contacts=Contacts(cfg.data_dir);self.asset_provider=asset_provider
         self.setText('Отправить');self.setToolTip('Подготовить оригинал в Telegram');self.setAccessibleName('Отправить в Telegram')
-        self.menu=QMenu(self);self.setMenu(self.menu);self.setPopupMode(QToolButton.InstantPopup)
+        # QToolButton.showMenu() enters a nested event loop while its PySide
+        # wrapper holds the GIL. FFmpeg teardown can then wait for a thread
+        # whose QObject destructor needs that GIL, freezing the entire app.
+        # Do not attach this menu with setMenu: native button clicks would
+        # still take the blocking path. Hover and click both use popup().
+        self.menu=QMenu(self)
         self.menu.aboutToShow.connect(self.populate)
+        self.menu.aboutToHide.connect(lambda:self.setDown(False))
+        self.clicked.connect(self.open_menu)
         self.hover=QTimer(self);self.hover.setSingleShot(True);self.hover.setInterval(180)
-        self.hover.timeout.connect(lambda:self.showMenu() if self.underMouse() and self.isEnabled() else None)
+        self.hover.timeout.connect(self.hover_menu)
         # The job owns its signals until completion. Closing a viewer disconnects
         # its slot without destroying an object still used by the worker.
         self.signals=ShareSignals();self.signals.finished.connect(self.finished)
         self.stop=threading.Event()
-        if parent and hasattr(parent,'finished'):parent.finished.connect(lambda *_:self.stop.set())
+        self.closed=False
+        if parent and hasattr(parent,'finished'):parent.finished.connect(self.cancel)
+        # Also cancel if an owner is destroyed without going through done().
+        self.destroyed.connect(self.stop.set)
 
-    def enterEvent(self,event):self.hover.start();super().enterEvent(event)
+    def enterEvent(self,event):
+        if not self.closed:self.hover.start()
+        super().enterEvent(event)
     def leaveEvent(self,event):self.hover.stop();super().leaveEvent(event)
+
+    def hover_menu(self):
+        if self.underMouse():self.open_menu()
+
+    def open_menu(self):
+        self.hover.stop()
+        if self.closed or not self.isEnabled() or not self.isVisible() or self.menu.isVisible():return
+        self.menu.popup(self.mapToGlobal(QPoint(0,self.height())))
+
+    def hideEvent(self,event):
+        self.hover.stop();self.menu.close()
+        super().hideEvent(event)
+
+    def cancel(self,*_):
+        self.closed=True;self.stop.set();self.hover.stop();self.menu.close();self.setDown(False)
 
     def populate(self):
         self.menu.clear()
@@ -212,11 +239,13 @@ class ShareButton(QToolButton):
         self.contacts.remove(contact);self.menu.close()
 
     def choose(self,contact):
+        if self.closed or not self.isEnabled():return
         self.menu.close();asset=self.asset_provider()
         if not asset:return
         self.stop.clear();self.setEnabled(False);self.setText('Подготовка…')
         QThreadPool.globalInstance().start(ShareJob(asset['path'],contact,self.signals,self.stop))
 
     def finished(self,error):
+        if self.closed:return
         self.setEnabled(True);self.setText('Отправить')
         if error and not self.stop.is_set():QMessageBox.information(self,'Telegram',error)

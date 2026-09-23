@@ -416,6 +416,7 @@ class Viewer(QDialog):
             self.label.setText(str(exc))
 
     def done(self, result):
+        self.share_button.cancel()
         if not self.finished_cleanup:
             self.finished_cleanup = True
             self.preview_buffer.close()
