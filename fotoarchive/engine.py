@@ -259,6 +259,8 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
     def emit(event):
         if shutdown.is_set():
             return
+        if event['type'] in ('ready', 'scan_done', 'index_done') and 'facets' in event and engine:
+            engine.catalog.set_state('startup_facets', event['facets'])
         try:
             events.put(event, timeout=1)
         except queue.Full:
@@ -289,10 +291,14 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
         review_id = None
         checking = deque()
         last_status = 0
+        last_saved_status = 0
+        inventory_refresh_at = time.monotonic() + 15
         maintenance_needed = False
         emit({"type": "ready", "facets": engine.catalog.facets(), "includes": cfg.includes})
-        pipeline.inventory.ensure()
         while not shutdown.is_set():
+            if inventory_refresh_at and time.monotonic() >= inventory_refresh_at:
+                inventory_refresh_at = 0
+                pipeline.inventory.start(background=True)
             if pipeline.remote:
                 pipeline.remote.set_active(not paused)
                 if pipeline.remote.collect():
@@ -639,11 +645,17 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                 engine.index.maintain()
                 maintenance_needed = False
             if time.monotonic() - last_status > 1:
-                emit({"type": "status", "stats": engine.catalog.stats(), "paused": paused,
+                status = {"type": "status", "stats": engine.catalog.stats(), "paused": paused,
                       "processing_metrics":engine.metrics.snapshot(),
                       "local_enabled":cfg.local_enabled,"remote_enabled":cfg.remote_enabled,
                       "scanning":pipeline.scanning, "scan":pipeline.scan_state,"pipeline":pipeline.status(),
-                      "inventory": pipeline.inventory.status()})
+                      "inventory": pipeline.inventory.status()}
+                emit(status)
+                if time.monotonic() - last_saved_status > 10:
+                    # Persist counts, not live GPU/queue telemetry from this run.
+                    engine.catalog.set_state('startup_status', {k: status[k] for k in
+                        ('stats', 'paused', 'inventory', 'local_enabled', 'remote_enabled')})
+                    last_saved_status = time.monotonic()
                 emit({'type':'orientation_progress','stats':orientation.store.stats()})
                 last_status = time.monotonic()
     except Exception as exc:

@@ -21,8 +21,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QDateEdit, QD
 
 from .catalog import Filters
 from .config import Settings
-from .engine import worker_main
-from .media import PreviewCache
+from .worker import worker_main
 from .gallery import PhotoModel
 from .smooth_scroll import PhotoGallery
 from .date_slider import DateRangeSlider
@@ -80,6 +79,12 @@ class Backend(QObject):
         self.timer.timeout.connect(self.poll)
         self.timer.start(80)
         self.dead_reported = False
+        from .startup import read_startup
+        from threading import Thread
+        self.bootstrap = Thread(target=read_startup, args=(cfg, self.event.emit,
+            self.reader.enable, self.library.enable), name='catalogue-startup', daemon=True)
+        # Connect the window and build its controls before delivering saved data.
+        QTimer.singleShot(0, self.bootstrap.start)
 
     def send(self, **message):
         from .interactive import SEARCH_ACTIONS
@@ -163,6 +168,7 @@ class PreviewTask(QRunnable):
         self.token, self.asset, self.cfg, self.original, self.signals = token, asset, cfg, original, signals
 
     def run(self):
+        from .media import PreviewCache
         try:
             if self.original:
                 from .media import open_rgb
@@ -552,6 +558,7 @@ class MainWindow(Workspace, QMainWindow):
         self.last_metadata_count = -1
         self.result_metadata_count = -1
         self.latest_stats = {}
+        self._live_status_received = False
         self.source_inventory = {'phase': 'counting', 'total': None, 'counts': {},
                                  'root': str(cfg.root), 'includes': list(cfg.includes)}
         self.setWindowTitle("FotoArchive — личная фототека")
@@ -1475,6 +1482,11 @@ class MainWindow(Workspace, QMainWindow):
         self._restoring_controls = restoring
 
     def on_event(self, event):
+        if event.get('type') == 'status':
+            if event.get('saved') and self._live_status_received:
+                return
+            if not event.get('saved'):
+                self._live_status_received = True
         if self.workspace_event(event):
             return
         kind = event["type"]
@@ -1654,7 +1666,7 @@ class MainWindow(Workspace, QMainWindow):
         elif kind == "working":
             names = {"metadata": "Подготовка каталога", "embedding": "Поисковый индекс", "caption": "Описание фотографии", "query": "Сложный поиск", "faces": "Поиск лиц", "location": "Место съёмки", "orientation": "Проверка ориентации", "rotation": "Поворот и обновление поиска"}
             self.stage_label.setText(names.get(event["stage"], event["stage"]) + " · " + event["filename"])
-        elif kind in {"ready", "scan_done", "index_done"}:
+        elif kind in {"catalog_ready", "ready", "scan_done", "index_done"}:
             if "includes" in event:
                 self.cfg.includes = event["includes"]
             self.update_facets(event.get("facets", {}))

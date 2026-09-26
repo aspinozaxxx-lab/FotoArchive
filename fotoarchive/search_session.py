@@ -7,7 +7,7 @@ import json
 class SearchSession:
     PAGE_SIZE = 200
 
-    def __init__(self, catalog, index, request_id, filters, query, vector, conditions, exclude_id=None, mode="semantic", excluded_faces=(), presentation=None, face_groups=None, people_mode='all'):
+    def __init__(self, catalog, index, request_id, filters, query, vector, conditions, exclude_id=None, mode="semantic", excluded_faces=(), presentation=None, face_groups=None, people_mode='all', cached_state=None):
         self.catalog, self.index = catalog, index
         self.request_id, self.filters = request_id, filters
         self.query, self.vector, self.conditions = query, vector, conditions
@@ -30,6 +30,21 @@ class SearchSession:
         self.view_offset = 0
         self.view_verdict = ""
         self.total = 0 if mode == "browse" else catalog.browse(filters, limit=0)[1]
+        if cached_state is not None:
+            self.total = cached_state['total']
+            self.metadata_count = cached_state['metadata_count']
+            self.media_totals = cached_state['media_totals']
+            self.exhausted = True
+            if saved := cached_state['presentation']:
+                from .presentation import Presentation
+                self.presentation = Presentation(self, saved['options'])
+                self.presentation.mapping_ready = True
+                signature = saved['signature']
+                self.presentation.signature = tuple(signature[:4]) + (tuple(signature[4]),)
+                self.presentation.matches_signature = tuple(saved['matches_signature'])
+                self.presentation.media_totals = saved['media_totals']
+                self.configure_presentation(self.presentation_options)
+            return
         # SQLite's temporary tables spill to disk; no full-archive list lives in Python or Qt.
         catalog.db.execute("PRAGMA temp_store=FILE")
         catalog.db.executescript("""

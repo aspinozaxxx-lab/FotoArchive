@@ -4,8 +4,6 @@ import json
 import math
 import time
 
-import av
-
 from .config import VIDEO_INTERVAL_MS
 
 
@@ -43,6 +41,7 @@ def _stream(container):
 
 
 def frame_at(path, milliseconds=0, max_side=2560):
+    import av
     with av.open(str(path), options={'protocol_whitelist': 'file,crypto,data'}) as container:
         stream = _stream(container)
         start = int(stream.start_time or 0)
@@ -69,6 +68,7 @@ def frame_at(path, milliseconds=0, max_side=2560):
 
 
 def probe(path):
+    import av
     with av.open(str(path), options={'protocol_whitelist': 'file,crypto,data'}) as container:
         stream = _stream(container)
         seconds = (float(stream.duration * stream.time_base) if stream.duration is not None else

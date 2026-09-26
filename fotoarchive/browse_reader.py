@@ -66,10 +66,17 @@ class BrowseViews:
         self.revision = None
         self.views = OrderedDict()
         self.maps = StackMaps(self.control)
+        from .browse_cache import BrowseCache
+        self.cache = BrowseCache(cfg)
+        self.identity = self.control.state('catalog_identity') or str((cfg.data_dir/'catalog.sqlite3').stat().st_ctime_ns)
+
+    def current_revision(self, command):
+        return (self.identity, self.control.state('browse_revision'),
+            self.control.state('library_revision') if
+            any(command.get('filters', {}).get(k) for k in ('place', 'has_gps', 'geo_bounds')) else None)
 
     def select(self, command, obsolete):
-        revision = (self.control.state('browse_revision'), self.control.state('library_revision') if
-                    any(command.get('filters', {}).get(k) for k in ('place', 'has_gps', 'geo_bounds')) else None)
+        revision = self.current_revision(command)
         if revision != self.revision:
             self.clear()
             self.maps.clear()
@@ -82,6 +89,8 @@ class BrowseViews:
         if options.get('stacks'):
             filters = replace(filters,media_kind='')
         key = tuple(sorted(asdict(filters).items())) + tuple((k, options.get(k)) for k in ('sort', 'stacks', 'seconds', 'versions'))
+        self.cache_key = key
+        self.cache_command = command
         if key in self.views:
             catalog, session = self.views[key]
             self.views.move_to_end(key)
@@ -95,16 +104,19 @@ class BrowseViews:
         catalog = Catalog.open_reader(self.cfg)
         catalog.db.set_progress_handler(lambda: int(obsolete()), 1000)
         try:
-            session = SearchSession(catalog, None, command['id'], filters, '', None, [], mode='browse', presentation=options)
+            saved = self.cache.load(catalog, key, revision)
+            session = SearchSession(catalog, None, command['id'], filters, '', None, [], mode='browse',
+                                    presentation=options, **({'cached_state': saved} if saved else {}))
             if session.presentation:
-                self.control.db.set_progress_handler(lambda:int(obsolete()),1000)
-                try:
-                    session.presentation.attach(self.maps.get(options))
-                finally:
-                    self.control.db.set_progress_handler(None,0)
-                session.media_totals = {row[0]:row[1] for row in catalog.db.execute('''SELECT a.media_kind,count(*)
-                  FROM active_search s CROSS JOIN assets a ON a.id=s.asset_id GROUP BY a.media_kind''')}
-                session.media_totals[''] = sum(session.media_totals.values())
+                if not saved:
+                    self.control.db.set_progress_handler(lambda:int(obsolete()),1000)
+                    try:
+                        session.presentation.attach(self.maps.get(options))
+                    finally:
+                        self.control.db.set_progress_handler(None,0)
+                    session.media_totals = {row[0]:row[1] for row in catalog.db.execute('''SELECT a.media_kind,count(*)
+                      FROM active_search s CROSS JOIN assets a ON a.id=s.asset_id GROUP BY a.media_kind''')}
+                    session.media_totals[''] = sum(session.media_totals.values())
                 session.presentation.media_kind = requested_media
                 session.total = session.media_totals.get(requested_media,0)
         except Exception:
@@ -115,7 +127,7 @@ class BrowseViews:
             _, (old, _) = self.views.popitem(last=False)
             old.close()
         self.maps.retain({getattr(session.presentation,'map_path',None) for _,session in self.views.values()})
-        return catalog, session, False
+        return catalog, session, bool(saved)
 
     def clear(self):
         for catalog, _ in self.views.values():
@@ -182,17 +194,37 @@ class BrowseReader:
         catalog = session = None
         views = None
         session_generation = -1
+        snapshot_at = None
         try:
             while True:
                 with self.condition:
-                    self.condition.wait_for(lambda: self.stopped or
-                        (self.ready and (self.request is not None or self.pages)))
+                    while not self.stopped and not (self.ready and (self.request is not None or self.pages)):
+                        if self.ready and snapshot_at is not None:
+                            remaining = snapshot_at - time.monotonic()
+                            if remaining <= 0:
+                                break
+                            self.condition.wait(remaining)
+                        else:
+                            self.condition.wait()
                     if self.stopped:
                         return
                     generation = self.generation
                     command, self.request = self.request, None
                     if command is None:
-                        _, command = self.pages.popitem(last=False)
+                        if self.pages:
+                            _, command = self.pages.popitem(last=False)
+                        else:
+                            command = {'action': 'save_cache'}
+                if command['action'] == 'save_cache':
+                    snapshot_at = None
+                    if session is not None and session_generation == generation:
+                        try:
+                            views.cache.save(session, views.cache_key, views.revision,
+                                lambda: self.obsolete(generation) or bool(self.pages) or
+                                views.current_revision(views.cache_command) != views.revision)
+                        except (OSError, sqlite3.Error):
+                            pass
+                    continue
                 started = time.perf_counter()
                 try:
                     if command['action'] == 'browse':
@@ -217,6 +249,9 @@ class BrowseReader:
                     event['read_seconds'] = time.perf_counter() - started
                     if not self.obsolete(generation):
                         self.emit(event)
+                        # Keep disk copying away from first paint, scrolling and
+                        # stack animation; any new request interrupts this idle job.
+                        snapshot_at = time.monotonic() + 1
                 except Exception as exc:
                     if catalog:
                         # A progress-handler interruption may roll back an INSERT

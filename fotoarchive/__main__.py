@@ -1,7 +1,10 @@
 import argparse
 import multiprocessing
 import sys
+import time
 from pathlib import Path
+
+STARTED = time.perf_counter()
 
 
 def main():
@@ -11,12 +14,16 @@ def main():
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--media-smoke-test", action="store_true")
     parser.add_argument('--browse-benchmark', action='store_true', help='Measure catalogue reads without opening or changing the library')
+    parser.add_argument('--startup-benchmark', action='store_true', help='Measure read-only first-window and thumbnail readiness without starting inference')
     parser.add_argument('--ui-smoke-test', action='store_true', help='Check the packaged Qt gallery and reader with generated records, without a real catalogue or GPU')
     parser.add_argument("--analyze-orientation", action="store_true", help="Start/resume recommendations for the already indexed photos")
     parser.add_argument('--map-smoke-test',action='store_true')
     parser.add_argument('--map-offline',action='store_true')
     parser.add_argument('--playback-smoke-test', action='store_true', help='Check photo/video sharing menu and closing with isolated generated media')
     args = parser.parse_args()
+    if args.startup_benchmark:
+        from .startup_benchmark import run
+        return run(args.data_dir, STARTED)
     if args.playback_smoke_test:
         if not args.data_dir:parser.error('--playback-smoke-test requires an isolated --data-dir')
         from .playback_smoke import run
@@ -49,7 +56,6 @@ def main():
     QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QMessageBox
-    from PySide6.QtWebEngineWidgets import QWebEngineView
     from .ui import MainWindow, STYLE
     cfg = Settings.load(args.data_dir)
     cfg.initialize()
@@ -70,13 +76,15 @@ def main():
         QMessageBox.information(None, "FotoArchive", "Приложение уже открыто для этого каталога.")
         return 0
     window = MainWindow(cfg)
+    from .startup import record_startup
+    record_startup(window, STARTED)
     if args.smoke_test:
         from .smoke import install_smoke_check
         install_smoke_check(application, window, cfg)
     window.show()
     if not args.smoke_test:
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(1800,window.map_widget.ensure)
+        QTimer.singleShot(10000,window.map_widget.ensure)
     if args.analyze_orientation:
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0,lambda:window.backend.send(action='orientation_start',filters={}))

@@ -8,8 +8,6 @@ from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from pathlib import Path
 
-import numpy as np
-
 from .config import Settings, EMBED_VERSION, CAPTION_VERSION, FACE_VERSION, GEO_VERSION, SUPPORTED, VIDEO_FORMATS, MEDIA_VERSION
 from .media_types import format_key
 
@@ -217,6 +215,9 @@ class Catalog:
               UPDATE app_state SET value=CAST(value AS INTEGER)+1 WHERE key='browse_revision';
             END;
         ''')
+        if not names_exist and not self.state('catalog_identity'):
+            from uuid import uuid4
+            self.set_state('catalog_identity', uuid4().hex)
 
     def close(self):
         self.db.close()
@@ -341,6 +342,7 @@ class Catalog:
                 self._enqueue(asset_id, job["file_version"])
 
     def complete_embedding(self, job, vector):
+        import numpy as np
         if not self.current_job(job):
             return
         vector = np.asarray(vector, dtype=np.float32)
@@ -364,6 +366,7 @@ class Catalog:
             self._enqueue(job["asset_id"], job["file_version"], job.get('unit_id'))
 
     def complete_location(self, job, location, vector=None):
+        import numpy as np
         if not self.current_job(job):
             return
         with self.db:
@@ -377,6 +380,7 @@ class Catalog:
             self._enqueue(job["asset_id"], job["file_version"])
 
     def complete_faces(self, job, records):
+        import numpy as np
         if not self.current_job(job):
             return
         import hashlib
@@ -411,6 +415,7 @@ class Catalog:
             AND a.present=1 AND (? IS NULL OR f.id IN (SELECT face_id FROM face_units WHERE unit_id=?)) ORDER BY f.id""", (asset_id, FACE_VERSION, unit_id, unit_id))]
 
     def face_vector(self, face_id):
+        import numpy as np
         row = self.db.execute("""SELECT f.vector FROM faces f JOIN assets a ON a.id=f.asset_id
             WHERE f.id=? AND f.file_version=a.version AND f.model_version=? AND a.present=1""", (face_id, FACE_VERSION)).fetchone()
         return np.frombuffer(row[0], dtype=np.float32).copy() if row else None
@@ -458,6 +463,7 @@ class Catalog:
             self.db.execute("UPDATE unit_jobs SET status='pending',error=NULL WHERE status='error'")
 
     def vector(self, asset_id, unit_id=None):
+        import numpy as np
         row = self.db.execute("SELECT e.vector FROM embeddings e JOIN units u ON u.id=e.unit_id JOIN assets a ON a.id=u.asset_id WHERE u.asset_id=? AND a.present=1 AND e.file_version=a.version AND e.model_version=? AND (? IS NULL OR u.id=?) ORDER BY u.timestamp_ms LIMIT 1", (asset_id, EMBED_VERSION, unit_id, unit_id)).fetchone()
         return np.frombuffer(row[0], dtype=np.float32).copy() if row else None
 

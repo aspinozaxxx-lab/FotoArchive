@@ -55,6 +55,28 @@ def test_total_precedes_registration_is_stable_and_includes_failed_photos(tmp_pa
         engine.close()
 
 
+def test_background_recount_keeps_saved_total_even_when_drive_is_offline(tmp_path):
+    cfg = config(tmp_path)
+    (cfg.root / 'first' / 'one.jpg').write_bytes(b'photo')
+    cat = Catalog(cfg)
+    inv = SourceInventory(cat)
+    try:
+        inv.ensure()
+        assert collect(inv)['total'] == 1
+        (cfg.root / 'first' / 'two.jpg').write_bytes(b'photo')
+        inv.start(background=True)
+        assert inv.status()['total'] == 1 and inv.status()['checking']
+        assert collect(inv)['total'] == 2
+        (cfg.root / 'first').rename(cfg.root / 'offline')
+        inv.start(background=True)
+        result = collect(inv)
+        assert result['total'] == 2 and result['error']
+        assert cat.state('source_inventory')['total'] == 2
+    finally:
+        inv.close()
+        cat.close()
+
+
 def test_nested_folders_restart_and_expanding_selection_do_not_double_count(tmp_path):
     cfg = config(tmp_path)
     (cfg.root / 'first' / 'one.jpg').write_bytes(b'photo')

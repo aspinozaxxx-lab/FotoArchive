@@ -108,17 +108,19 @@ class SourceInventory:
         self.error = None
         self.counter = None
         self.counting_key = None
+        self.background = False
 
     def ensure(self):
         if self.phase != 'ready' and self.counter is None:
             self.start()
 
-    def start(self, force=False):
+    def start(self, force=False, background=False):
         key = selection_key(self.cfg)
         if not force and self.counter is not None and self.counting_key == key:
             return
         self.close()
-        self.phase, self.error, self.counting_key = 'counting', None, key
+        self.background = background and self.phase == 'ready' and self.saved.get('selection') == key
+        self.phase, self.error, self.counting_key = ('ready' if self.background else 'counting'), None, key
         self.counter = InventoryCounter(self.cfg)
         self.emit({'type': 'source_inventory', 'inventory': self.status()})
 
@@ -131,7 +133,7 @@ class SourceInventory:
             if 'error' in result:
                 # A missing disk or failed directory read cannot replace a good
                 # manifest with a smaller partial result or an empty catalogue.
-                self.phase, self.error = 'error', result['error']
+                self.phase, self.error = ('ready' if self.background else 'error'), result['error']
             else:
                 summary = result | {'selection': self.counting_key, 'completed_at': time.time()}
                 db = self.catalog.db
@@ -146,7 +148,7 @@ class SourceInventory:
                     db.execute('DETACH DATABASE inventory_incoming')
                 self.saved, self.phase = summary, 'ready'
         except Exception as exc:
-            self.phase, self.error = 'error', str(exc)
+            self.phase, self.error = ('ready' if self.background else 'error'), str(exc)
         finally:
             counter.close()
         self.emit({'type': 'source_inventory', 'inventory': self.status()})
@@ -167,7 +169,8 @@ class SourceInventory:
                 LEFT JOIN jobs j ON j.asset_id=a.id AND j.stage='metadata' AND j.file_version=a.version''',
                 (EMBED_VERSION, CAPTION_VERSION, FACE_VERSION, GEO_VERSION)).fetchone()
             counts = {key: value or 0 for key, value in dict(row).items()}
-        return {'phase': self.phase, 'total': self.saved.get('total') if self.phase == 'ready' else None,
+        return {'phase': self.phase, 'checking': self.counter is not None,
+                'total': self.saved.get('total') if self.phase == 'ready' else None,
                 'last_total': self.saved.get('total'), 'counts': counts, 'error': self.error,
                 'format_counts': self.saved.get('format_counts') if self.phase == 'ready' else None,
                 'root': str(self.cfg.root), 'includes': list(self.cfg.includes)}
