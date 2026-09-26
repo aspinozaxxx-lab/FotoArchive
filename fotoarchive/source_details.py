@@ -18,7 +18,9 @@ def source_summary(inventory):
     scope = folder_scope(inventory.get('includes', []))
     formats = inventory.get('format_counts')
     if inventory.get('phase') != 'ready' or formats is None:
-        detail = 'подсчёт недоступен' if inventory.get('phase') == 'error' else 'подсчитываю состав папок…'
+        detail = ('подсчёт недоступен' if inventory.get('phase') == 'error' else
+                  'подсчитываю состав папок…' if inventory.get('checking') or inventory.get('phase') == 'counting' else
+                  'состав папок доступен после «Проверить обновления»')
         return f'Источник: {scope} · {detail}'
     counts = format_totals(formats)
     return (f'Источник: {scope} · изображений: {number(counts["images"])} · '
@@ -36,7 +38,10 @@ def source_html(inventory):
              '<p>Счётчики относятся к подключённым папкам со всеми вложенными папками.</p>']
     formats = inventory.get('format_counts')
     if inventory.get('phase') != 'ready' or formats is None:
-        parts.append('<p>' + escape(inventory.get('error') or 'Подсчитываю файлы. Закройте и откройте это окно через несколько секунд.') + '</p>')
+        detail = ('Подсчитываю файлы. Закройте и откройте это окно через несколько секунд.'
+                  if inventory.get('checking') or inventory.get('phase') == 'counting' else
+                  'Нажмите «Проверить обновления», чтобы прочитать состав подключённых папок.')
+        parts.append('<p>' + escape(inventory.get('error') or detail) + '</p>')
         return ''.join(parts)
     counts = format_totals(formats)
     scanned = inventory.get('counts', {}).get('scanned', 0)

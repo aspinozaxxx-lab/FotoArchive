@@ -11,7 +11,7 @@ from pathlib import Path
 from filelock import FileLock, Timeout as LockTimeout
 
 from .catalog import Catalog, Filters, enumerate_source
-from .config import Settings, VERIFY_VERSION, FACE_VERSION, SUPPORTED
+from .config import Settings, VERIFY_VERSION, FACE_VERSION
 from .inference import Embedder, GPUUnavailable, VisionLanguage
 from .media import extract_metadata, atomic_thumbnail, sha256, visual_path
 from .search import SearchIndex
@@ -280,25 +280,17 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
             pipeline.remote = RemoteJobs(engine,lambda: not shutdown.is_set() and
                 remote_lifetime[1]>0 and remote_lifetime[2]>0 and time.monotonic()-remote_lifetime[0]<6)
         paused = engine.catalog.state("paused", True)
-        previous_formats = set(engine.catalog.state('media_formats', ['.jpg', '.jpeg', '.bmp']))
-        if SUPPORTED - previous_formats:
-            pipeline.request_scan()
-            engine.catalog.set_state('media_formats', sorted(SUPPORTED))
-            paused = False
-            engine.catalog.set_state('paused', False)
+        # Opening the catalogue never schedules source discovery, including
+        # after decoder upgrades. Only explicit requests add scans to the queue.
         context = None
         reviewing = None
         review_id = None
         checking = deque()
         last_status = 0
         last_saved_status = 0
-        inventory_refresh_at = time.monotonic() + 15
         maintenance_needed = False
         emit({"type": "ready", "facets": engine.catalog.facets(), "includes": cfg.includes})
         while not shutdown.is_set():
-            if inventory_refresh_at and time.monotonic() >= inventory_refresh_at:
-                inventory_refresh_at = 0
-                pipeline.inventory.start(background=True)
             if pipeline.remote:
                 pipeline.remote.set_active(not paused)
                 if pipeline.remote.collect():

@@ -103,15 +103,18 @@ class SourceInventory:
         with catalog.db:
             catalog.db.execute('CREATE TABLE IF NOT EXISTS source_inventory(path_key TEXT PRIMARY KEY) WITHOUT ROWID')
         self.saved = catalog.state('source_inventory', {})
-        self.phase = ('ready' if self.saved.get('selection') == selection_key(self.cfg)
-                      and 'format_counts' in self.saved else 'counting')
+        # Saved counts remain usable until the user checks the folders again.
+        # No counter is running just because the selection/decoder rules changed.
+        self.phase = 'ready' if 'total' in self.saved else 'idle'
         self.error = None
         self.counter = None
         self.counting_key = None
         self.background = False
 
     def ensure(self):
-        if self.phase != 'ready' and self.counter is None:
+        if self.counter is None and (self.phase != 'ready'
+                or self.saved.get('selection') != selection_key(self.cfg)
+                or 'format_counts' not in self.saved):
             self.start()
 
     def start(self, force=False, background=False):

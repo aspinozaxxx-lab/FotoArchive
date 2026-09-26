@@ -6,12 +6,68 @@ import subprocess
 import sys
 import time
 from threading import Event
+from types import SimpleNamespace
+
+import pytest
 
 from fotoarchive.browse_reader import BrowseReader, BrowseViews
 from fotoarchive.catalog import Catalog
 from fotoarchive.config import Settings
 from fotoarchive.startup import read_startup
 from test_browse_reader import sample_catalog, stop
+
+
+@pytest.mark.parametrize('paused', [True, False])
+@pytest.mark.parametrize('saved_inventory', [True, False])
+def test_worker_restart_never_scans_sources_even_after_decoder_upgrade_or_delay(
+        tmp_path, monkeypatch, paused, saved_inventory):
+    from fotoarchive import engine as worker
+    from fotoarchive import pipeline
+    from fotoarchive.inventory import SourceInventory
+    from test_catalog import make_image, prepare
+
+    cfg = Settings(data_dir=tmp_path / 'data', root=tmp_path / 'photos',
+                   local_enabled=False, remote_enabled=False)
+    cfg.save()
+    catalog = Catalog(cfg)
+    prepare(catalog, make_image(cfg))
+    catalog.set_state('paused', paused)
+    catalog.set_state('media_formats', ['.jpg', '.jpeg', '.bmp'])
+    saved = {'total': 1, 'format_counts': {'.jpg': 1},
+             'selection': {'formats': ['.jpg']}, 'completed_at': 123}
+    if saved_inventory:
+        catalog.set_state('source_inventory', saved)
+    catalog.close()
+    cfg.root.rename(tmp_path / 'offline')
+
+    def unexpected_scan(*args, **kwargs):
+        raise AssertionError('Opening the application must not enumerate source folders')
+    monkeypatch.setattr(SourceInventory, 'start', unexpected_scan)
+    monkeypatch.setattr(pipeline, 'SourceScanner', unexpected_scan)
+    clock = [0]
+    monkeypatch.setattr(worker, 'time', SimpleNamespace(
+        monotonic=lambda: clock[0], time=time.time, perf_counter=time.perf_counter))
+    class Commands:
+        def get(self, timeout):
+            clock[0] += 30
+            if clock[0] > 600:
+                return {'action': 'stop'}
+            raise queue.Empty
+    events = queue.Queue()
+    worker.worker_main(cfg.data_dir, Commands(), events, Event())
+    received = list(events.queue)
+    assert not [e for e in received if e['type'] in ('error', 'fatal', 'source_inventory', 'scan_done')]
+    statuses = [e for e in received if e['type'] == 'status']
+    assert len(statuses) == 20
+    assert all(not e['scanning'] and not e['inventory']['checking'] for e in statuses)
+    assert all(e['stats']['total'] == 1 and e['paused'] == paused for e in statuses)
+    assert statuses[-1]['inventory']['phase'] == ('ready' if saved_inventory else 'idle')
+    catalog = Catalog.open_reader(cfg)
+    try:
+        assert catalog.state('scan_queue', []) == []
+        assert catalog.state('source_inventory', {}) == (saved if saved_inventory else {})
+    finally:
+        catalog.close()
 
 
 def command(**options):

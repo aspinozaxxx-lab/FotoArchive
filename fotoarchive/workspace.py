@@ -116,9 +116,12 @@ class Workspace:
         self.navigation_tabs.currentChanged.connect(lambda index: self.request_map() if index==2 else None)
         # A single settings menu replaces permanent maintenance controls.
         menu = QMenu(self)
+        menu.setToolTipsVisible(True)
         for label, callback in [('Добавить папки…',self.add_folder),('Проверить обновления',self.check_updates),
                                 ('Поворот фото…',self.orientation_dialog),('Модели…',self.models_dialog)]:
-            menu.addAction(label,callback)
+            action = menu.addAction(label,callback)
+            if label == 'Проверить обновления':
+                action.setToolTip(self.check_updates_button.toolTip())
         menu.addSeparator()
         themes = menu.addMenu('Оформление')
         for label,key in [('Как в Windows','system'),('Светлое','light'),('Тёмное','dark')]:

@@ -559,7 +559,7 @@ class MainWindow(Workspace, QMainWindow):
         self.result_metadata_count = -1
         self.latest_stats = {}
         self._live_status_received = False
-        self.source_inventory = {'phase': 'counting', 'total': None, 'counts': {},
+        self.source_inventory = {'phase': 'idle', 'total': None, 'counts': {},
                                  'root': str(cfg.root), 'includes': list(cfg.includes)}
         self.setWindowTitle("FotoArchive — личная фототека")
         self.resize(1480, 940)
@@ -642,12 +642,8 @@ class MainWindow(Workspace, QMainWindow):
         self.build_details()
         self.splitter.setSizes([244, 850, 330])
         main_outer = outer
-        self.processing_panel = QScrollArea()
-        self.processing_panel.setWidgetResizable(True)
-        self.processing_panel.setFrameShape(QFrame.NoFrame)
-        self.processing_panel.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.processing_panel.setMaximumHeight(520)
-        self.processing_panel.setStyleSheet("QScrollArea, QScrollArea > QWidget > QWidget { background: transparent; }")
+        from .processing_drawer import ProcessingDrawer
+        self.processing_panel = ProcessingDrawer()
         processing_content = QWidget()
         self.processing_panel.setWidget(processing_content)
         main_outer.addWidget(self.processing_panel)
@@ -663,14 +659,19 @@ class MainWindow(Workspace, QMainWindow):
         self.remote_panel = RemotePanel(cfg,self.backend)
         outer.addWidget(self.remote_panel)
         source_row = QHBoxLayout()
-        self.source_label = QLabel('Подсчитываю состав добавленных папок…')
+        self.source_label = QLabel('Открываю сохранённый каталог…')
         self.source_label.setObjectName('muted')
         self.source_label.setWordWrap(True)
         self.source_label.setTextFormat(Qt.PlainText)
         source_row.addWidget(self.source_label, 1)
         self.check_updates_button = QPushButton('Проверить обновления')
-        self.check_updates_button.setToolTip('Найти новые, заменённые и удалённые файлы в подключённых папках. '
-                                            'Неизменённые снимки сохраняют готовые результаты обработки.')
+        self.check_updates_button.setToolTip(
+            'Проверить изменения в фототеке, а не обновления программы.\n'
+            'Просмотреть все подключённые папки и подпапки: добавить новые фото и видео, '
+            'обновить изменённые и убрать из каталога удалённые файлы.\n'
+            'Неизменённые файлы не обрабатываются заново. Оригиналы не изменяются. '
+            'Если диск или папка недоступны, их записи сохраняются.\n'
+            'При запуске приложения эта проверка не выполняется.')
         self.check_updates_button.clicked.connect(self.check_updates)
         source_row.addWidget(self.check_updates_button)
         source_details = QPushButton('Состав каталога')
@@ -1724,6 +1725,11 @@ class MainWindow(Workspace, QMainWindow):
                 tooltip = (inventory.get('error') or 'Не удалось подсчитать снимки.') + '\nКаталог сохранён. Подсчёт повторится при продолжении индексации.'
                 if inventory.get('last_total') is not None:
                     tooltip += f"\nПоследнее известное количество: {inventory['last_total']}."
+            elif inventory.get('phase') == 'idle':
+                label.setText(f'{name}  {done:,}'.replace(',', ' '))
+                bar.setRange(0, 1)
+                bar.setValue(0)
+                tooltip = 'Состав папок ещё не проверен. Нажмите «Проверить обновления», чтобы прочитать файлы и обновить каталог.'
             else:
                 label.setText('Каталог · считаю снимки…' if key == 'metadata' else f'{name}  {done:,} / …'.replace(',', ' '))
                 bar.setRange(0, 0)

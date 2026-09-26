@@ -235,6 +235,11 @@ def test_check_updates_button_progress_and_unchanged_check_preserve_view(qtbot, 
     backend = FakeBackend()
     window = MainWindow(Settings(data_dir=tmp_path), backend)
     qtbot.addWidget(window)
+    action = next(a for a in window.library_menu.menu().actions() if a.text() == 'Проверить обновления')
+    assert window.library_menu.menu().toolTipsVisible()
+    assert action.toolTip() == window.check_updates_button.toolTip()
+    assert 'а не обновления программы' in action.toolTip()
+    assert 'подпапки' in action.toolTip() and 'При запуске' in action.toolTip()
     window.check_updates_button.click()
     assert backend.sent[-1] == {'action': 'check_updates'}
     assert not window.check_updates_button.isEnabled()
