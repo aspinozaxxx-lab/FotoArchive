@@ -53,6 +53,8 @@ def main(cfg=None, progress=None):
     cfg.save()
     from .extra_models import setup
     setup(cfg, progress)
+    from .video_setup import download_models
+    download_models(cfg,progress)
     progress("Модели и локальный модуль готовы")
 
 

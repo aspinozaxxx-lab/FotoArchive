@@ -26,6 +26,16 @@ VIDEO_FORMATS = {'.mp4', '.mov', '.avi', '.mts', '.m2ts', '.mkv', '.wmv', '.mpg'
 SUPPORTED = IMAGE_FORMATS | RAW_FORMATS | VIDEO_FORMATS
 MEDIA_VERSION = 'media-v2:raw-heif-av:video-step10s'
 VIDEO_INTERVAL_MS = 10000
+VIDEO_SEGMENT_MS = 30_000
+VIDEO_SAMPLE_MS = 1000
+VIDEO_PIXEL_BUDGET = 64_000_000
+VIDEO_OMNI_REPO = 'openbmb/MiniCPM-o-4_5'
+VIDEO_OMNI_REV = '503e754207c94da6bb26850b4469f367c9ea3582'
+VIDEO_INTERN_REPO = 'OpenGVLab/InternVideo2_5_Chat_8B'
+VIDEO_INTERN_REV = '87680fe232af8681b55322f68541679b91f99df1'
+VIDEO_RUNTIME_REV = '61d8393fdddff58e8f831ccfdf8a80ff989ebf9c'
+VIDEO_GGUF_REV = 'db25077c33951fe163b42986fba0132e279872a2'
+VIDEO_VERSION = f'video-av-v3:30s-max:1fps:lossless-original:mono16k:{VIDEO_OMNI_REV}:{VIDEO_GGUF_REV}:ru-{QWEN_REV}:people-tiles-v2:caption-vector-v1'
 
 
 @dataclass
@@ -41,10 +51,11 @@ class Settings:
     local_enabled: bool = True
     remote_host: str = 'gpu-mlserver'
     remote_port: int = 18765
+    video_model: str = 'omni'
 
     def initialize(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        for name in ("models/siglip", "models/qwen", "models/faces", "geonames", "faces", "runtime", "thumbnails", "previews", "logs", "reports", "vectors"):
+        for name in ("models/siglip", "models/qwen", "models/faces", "models/video-omni", "geonames", "faces", "runtime", "thumbnails", "previews", "logs", "reports", "vectors"):
             (self.data_dir / name).mkdir(parents=True, exist_ok=True)
 
     @classmethod
@@ -64,6 +75,9 @@ class Settings:
             obj.local_enabled = bool(saved.get('local_enabled', True))
             obj.remote_host = saved.get('remote_host', 'gpu-mlserver')
             obj.remote_port = int(saved.get('remote_port', 18765))
+            obj.video_model = saved.get('video_model', 'omni')
+            if obj.video_model not in ('omni', 'internvideo'):
+                obj.video_model = 'omni'
         return obj
 
     def save(self):
@@ -75,6 +89,6 @@ class Settings:
                                    "preparation_workers": self.preparation_workers,
                                    "remote_enabled": self.remote_enabled, "remote_host": self.remote_host,
                                    "local_enabled": self.local_enabled,
-                                   "remote_port": self.remote_port},
+                                   "remote_port": self.remote_port, "video_model": self.video_model},
                                   ensure_ascii=False, indent=2), encoding="utf-8")
         temp.replace(path)

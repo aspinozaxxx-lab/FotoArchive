@@ -13,6 +13,13 @@ from .remote_protocol import MAX_PENDING
 
 def claim_bundle(catalog, excluded=()):
     db = catalog.db
+    from .video_archive import claim
+    video = claim(catalog, excluded=excluded)
+    if video:
+        from .video_people import people_snapshot, transport_people
+        asset, job = video
+        asset['video_people'] = transport_people(people_snapshot(catalog))
+        return asset, [job]
     skip = ' AND a.id NOT IN ('+','.join('?' for _ in excluded)+')' if excluded else ''
     # One ordered index seek per stage avoids sorting the entire archive for
     # every input. The separate asset/status index makes overlap checks cheap
@@ -21,6 +28,8 @@ def claim_bundle(catalog, excluded=()):
     sql='''SELECT j.asset_id FROM jobs j INDEXED BY jobs_ready JOIN assets a ON a.id=j.asset_id
         WHERE j.status='pending' AND j.stage=? AND j.file_version=a.version
         AND a.present=1 AND a.metadata_ready=1
+        AND (a.media_kind<>'video' OR j.stage='location' OR NOT EXISTS(
+            SELECT 1 FROM jobs v WHERE v.asset_id=a.id AND v.stage='video'))
         AND NOT EXISTS(SELECT 1 FROM jobs busy WHERE busy.asset_id=a.id AND busy.status='running')'''+skip+'''
         ORDER BY j.asset_id DESC LIMIT 1'''
     for stage in ('embedding','faces','caption','location'):
@@ -32,7 +41,7 @@ def claim_bundle(catalog, excluded=()):
     asset = catalog.get(max(candidates))
     jobs = []
     with db:
-        if asset['media_kind']=='video':
+        if asset['media_kind']=='video' and not db.execute("SELECT 1 FROM jobs WHERE asset_id=? AND stage='video'", (asset['id'],)).fetchone():
             unit = db.execute('''SELECT u.id,u.timestamp_ms FROM units u JOIN unit_jobs j ON j.unit_id=u.id
                 WHERE u.asset_id=? AND j.file_version=? AND j.status='pending'
                 ORDER BY u.timestamp_ms LIMIT 1''',(asset['id'],asset['version'])).fetchone()
@@ -45,7 +54,7 @@ def claim_bundle(catalog, excluded=()):
             if location:
                 jobs.append(dict(location))
         else:
-            jobs = [dict(row) for row in db.execute("SELECT asset_id,stage,file_version,model_version FROM jobs WHERE asset_id=? AND status='pending' AND stage IN ('embedding','faces','caption','location')",(asset['id'],))]
+            jobs = [dict(row) for row in db.execute("SELECT asset_id,stage,file_version,model_version FROM jobs WHERE asset_id=? AND status='pending' AND stage IN ('embedding','faces','caption','location') AND (?<>'video' OR stage='location')",(asset['id'],asset['media_kind']))]
         for job in jobs:
             db.execute("UPDATE jobs SET status='running',attempts=attempts+1 WHERE asset_id=? AND stage=?",(asset['id'],job['stage']))
     return asset,jobs
@@ -153,12 +162,22 @@ class RemoteJobs:
                     stage = job['stage']
                     if stage not in result['stages']:
                         receipt = 'partial'
-                        self.catalog.requeue_jobs([job])
-                        self.defer(asset['id'])
-                        self.engine.metrics.record(job,result.get('errors',{}).get(stage,'Неполный результат'),'remote')
+                        message = result.get('errors',{}).get(stage,'Неполный результат')
+                        if stage=='video' and job.get('attempts',0)>=1:
+                            self.catalog.finish_job(job,result.get('elapsed',0),message,source='remote')
+                        else:
+                            self.catalog.requeue_jobs([job])
+                            self.defer(asset['id'])
+                            self.engine.metrics.record(job,message,'remote')
                         continue
                     value = result['stages'][stage]
-                    if stage=='embedding':
+                    if stage=='video':
+                        from .video_jobs import decode_result
+                        from .video_archive import complete
+                        if not complete(self.catalog,job,decode_result(value)):
+                            receipt = 'discarded'
+                            continue
+                    elif stage=='embedding':
                         self.catalog.complete_embedding(job,vector(value,768))
                     elif stage=='faces':
                         self.catalog.complete_faces(job,decode_faces(value))
@@ -179,7 +198,10 @@ class RemoteJobs:
                     completed += 1
             except Exception as exc:
                 receipt = 'discarded'
-                self.catalog.requeue_jobs(jobs)
+                if len(jobs)==1 and jobs[0]['stage']=='video' and jobs[0].get('attempts',0)>=1:
+                    self.catalog.finish_job(jobs[0],0,str(exc),source='remote')
+                else:
+                    self.catalog.requeue_jobs(jobs)
                 # One changed/unreadable input must not stop refilling the
                 # entire server for a minute. Network retries live in Transport.
                 self.defer(asset['id'])

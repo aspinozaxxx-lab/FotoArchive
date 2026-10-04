@@ -11,6 +11,7 @@ def main():
     multiprocessing.freeze_support()
     parser = argparse.ArgumentParser(description="FotoArchive")
     parser.add_argument("--data-dir")
+    parser.add_argument('--video-worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--media-smoke-test", action="store_true")
     parser.add_argument('--browse-benchmark', action='store_true', help='Measure catalogue reads without opening or changing the library')
@@ -21,6 +22,21 @@ def main():
     parser.add_argument('--map-offline',action='store_true')
     parser.add_argument('--playback-smoke-test', action='store_true', help='Check photo/video sharing menu and closing with isolated generated media')
     args = parser.parse_args()
+    if args.video_worker:
+        if getattr(sys,'frozen',False) and sys.platform=='win32':
+            # The windowed PyInstaller bootloader leaves sys.std* as None.
+            # Explicitly reopen the inherited private pipes; no console window.
+            import ctypes,io,msvcrt,os
+            api=ctypes.windll.kernel32
+            api.GetStdHandle.restype=ctypes.c_void_p
+            for name,identifier,flags,mode in (('stdin',-10,os.O_RDONLY,'rb'),('stdout',-11,os.O_WRONLY,'wb'),('stderr',-12,os.O_WRONLY,'wb')):
+                if getattr(sys,name) is None:
+                    fd=msvcrt.open_osfhandle(api.GetStdHandle(identifier),flags)
+                    setattr(sys,name,io.TextIOWrapper(os.fdopen(fd,mode),encoding='utf-8',write_through=True))
+                elif hasattr(getattr(sys,name),'reconfigure'):
+                    getattr(sys,name).reconfigure(encoding='utf-8')
+        from .video_worker import main as video_worker
+        return video_worker(args.data_dir)
     if args.startup_benchmark:
         from .startup_benchmark import run
         return run(args.data_dir, STARTED)

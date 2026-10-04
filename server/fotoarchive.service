@@ -9,6 +9,10 @@ Group=fotoarchive
 WorkingDirectory=/opt/fotoarchive/app
 Environment=PYTHONUNBUFFERED=1
 Environment=PYTHONPATH=/opt/fotoarchive/app
+Environment=HF_HOME=/data/fotoarchive/runtime/video-torch/hf-cache
+Environment=TORCH_HOME=/data/fotoarchive/runtime/video-torch/torch-cache
+Environment=XDG_CACHE_HOME=/data/fotoarchive/runtime/video-torch/cache
+Environment=CUDA_CACHE_PATH=/data/fotoarchive/runtime/video-torch/cache
 Environment=LD_LIBRARY_PATH=/data/fotoarchive/runtime/b11009/cudart-llama-b11009-bin-ubuntu-cuda-12.8-x64
 ExecStart=/opt/fotoarchive/venv/bin/python -m fotoarchive.remote_service --data /data/fotoarchive --token-file /data/fotoarchive/service-token --passive-pids 3206,4807
 Restart=on-failure
@@ -19,7 +23,7 @@ LimitCORE=0
 UMask=0077
 Nice=10
 CPUQuota=800%
-MemoryMax=24G
+MemoryMax=40G
 TasksMax=256
 IOWeight=10
 NoNewPrivileges=true

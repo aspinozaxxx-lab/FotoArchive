@@ -74,13 +74,28 @@ class MediaUnits:
         if asset.get('media_kind') != 'video':
             return result
         where, values = ('u.id=?', [unit_id]) if unit_id else ('u.asset_id=?', [asset['id']])
-        unit = self.db.execute('''SELECT u.id,u.timestamp_ms,d.* FROM units u JOIN unit_details d ON d.unit_id=u.id
+        unit = self.db.execute('''SELECT u.id,u.kind,u.timestamp_ms,d.* FROM units u JOIN unit_details d ON d.unit_id=u.id
             WHERE ''' + where + ' AND u.asset_id=? AND d.file_version=? ORDER BY u.timestamp_ms LIMIT 1',
             values + [asset['id'], asset['version']]).fetchone()
         if unit:
             result.update(unit_id=unit['id'], timestamp_ms=unit['timestamp_ms'], unit_thumbnail=unit['thumbnail'])
+            if unit['kind']=='segment':
+                frame=self.db.execute("SELECT id FROM units WHERE asset_id=? AND kind='frame' AND timestamp_ms=?",(asset['id'],unit['timestamp_ms'])).fetchone()
+                if frame:
+                    result['unit_id']=frame['id']
             if Path(unit['thumbnail']).exists():
                 result['thumbnail'] = unit['thumbnail']
-            result['description'] = unit['description']
-            result['observations_json'] = unit['observations_json']
+            result['description'] = unit['description'] if unit_id else asset['description']
+            result['observations_json'] = unit['observations_json'] if unit_id else asset['observations_json']
+            # Read-only first-window readers can predate the worker's migration.
+            exists = self.db.execute("SELECT 1 FROM sqlite_master WHERE name='video_segments'").fetchone()
+            segment = (self.db.execute('''SELECT u.id,u.timestamp_ms,s.end_ms,d.description,d.observations_json
+                FROM video_segments s JOIN units u ON u.id=s.unit_id JOIN unit_details d ON d.unit_id=u.id
+                WHERE u.asset_id=? AND u.timestamp_ms<=? AND s.end_ms>? AND s.base_json IS NOT NULL
+                ORDER BY u.timestamp_ms DESC LIMIT 1''', (asset['id'],unit['timestamp_ms'],unit['timestamp_ms'])).fetchone() if exists else None)
+            if segment:
+                if unit_id:
+                    result['description'], result['observations_json'] = segment['description'],segment['observations_json']
+                result.update(video_start_ms=segment['timestamp_ms'], video_end_ms=segment['end_ms'],
+                              description_scope='segment')
         return result

@@ -54,6 +54,10 @@ def prepare_video(engine):
     asset_id, _ = engine.catalog.register(path)
     engine.process_one(('metadata',), asset_id)
     assert engine.catalog.get(asset_id)['metadata_ready'] == 1
+    # These tests retain coverage for the previous per-frame catalogue format.
+    # The new chronological pipeline has separate end-to-end tests.
+    engine.catalog.db.execute("DELETE FROM jobs WHERE stage='video' AND asset_id=?",(asset_id,))
+    engine.catalog.db.commit()
     return asset_id, path
 
 
@@ -71,6 +75,7 @@ def test_frame_progress_resumes_filters_and_search_return_matched_time(cfg):
         interrupted = cat.next_job(('embedding',))
         assert interrupted['timestamp_ms'] == 10000
         cat.recover()
+        cat.db.execute("DELETE FROM jobs WHERE stage='video'");cat.db.commit()
         resumed = cat.next_job(('embedding',))
         assert resumed['unit_id'] == interrupted['unit_id']
         cat.complete_embedding(resumed, vectors[1]); cat.finish_job(resumed, .1)

@@ -18,6 +18,11 @@ class ProcessingPipeline:
         self.inputs = EmbeddingInputs(engine)
         self.inventory = SourceInventory(self.catalog, engine.emit)
         self.captions = CaptionJobs(engine)
+        from .video_jobs import VideoJobs
+        self.videos = VideoJobs(engine)
+        self.people_refresh = None
+        self.people_revision = self.catalog.state('video_people_revision', '')
+        self.people_check_at = 0
         self.remote = None
         self.requests = self.catalog.state('scan_queue', [])
         self.scanner = None
@@ -40,7 +45,25 @@ class ProcessingPipeline:
 
     @property
     def idle(self):
-        return not self.scanning and not self.cpu.pending and not self.inputs.pending and not self.captions.pending and not (self.remote and self.remote.pending)
+        return not self.scanning and not self.cpu.pending and not self.inputs.pending and not self.captions.pending and not self.videos.pending and not (self.remote and self.remote.pending)
+
+    def refresh_people(self):
+        now = time.monotonic()
+        if now >= self.people_check_at:
+            self.people_check_at = now+1
+            revision = self.catalog.state('video_people_revision', '')
+            if revision != self.people_revision:
+                from .video_archive import refresh_person_names
+                self.people_refresh = refresh_person_names(self.catalog)
+                self.people_revision = revision
+        if self.people_refresh:
+            deadline = time.monotonic()+.015
+            try:
+                while time.monotonic() < deadline:
+                    next(self.people_refresh)
+            except StopIteration:
+                self.people_refresh = None
+            self.engine.index.start_flush()
 
     def request_scan(self, includes=None, skip_includes=(), reconcile=False):
         request = {'includes':list(self.engine.cfg.includes if includes is None else includes),
@@ -171,6 +194,8 @@ class ProcessingPipeline:
                                    'prepared_inputs':sum(f.done() for f in self.inputs.pending),
                                    'input_queue':len(self.inputs.pending),
                                    'caption_running':self.captions.pending,
+                                   'video_running':self.videos.pending,
+                                   'video_notice':self.videos.notice,
                                    'index_writing':self.engine.index.writing is not None,
                                    'library_check': check}
 
@@ -184,3 +209,4 @@ class ProcessingPipeline:
         self.cpu.close()
         self.inputs.close()
         self.captions.close()
+        self.videos.close()

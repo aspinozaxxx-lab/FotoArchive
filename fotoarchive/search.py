@@ -38,6 +38,7 @@ class SearchIndex:
         self.table = self.connection.create_table("photos", schema=SCHEMA, exist_ok=True)
         self.contexts = self.connection.create_table("places", schema=SCHEMA, exist_ok=True)
         self.faces = self.connection.create_table("faces", schema=FACE_SCHEMA, exist_ok=True)
+        self.scenes = self.connection.create_table('video_descriptions',schema=SCHEMA,exist_ok=True)
         if not any("unit_id" in idx.columns for idx in self.table.list_indices()):
             self.table.create_index("unit_id", config=BTree())
 
@@ -45,8 +46,8 @@ class SearchIndex:
         assets = list({a['id']: a for a in assets if a}.values())
         ids = [a["id"] for a in assets]
         if not ids:
-            return [], [], []
-        context_rows, face_rows = [], []
+            return [], [], [], []
+        context_rows, face_rows, scene_rows = [], [], []
         for asset in assets:
             if not asset or not asset["present"]:
                 continue
@@ -61,13 +62,18 @@ class SearchIndex:
                                                  (asset["id"], asset["version"], FACE_VERSION)):
                 face_rows.append(base | {"unit_id": face["id"], "model_version": FACE_VERSION,
                                          "vector": np.frombuffer(face["vector"], dtype=np.float32).tolist()})
-        return ids, context_rows, face_rows
+            for scene in self.catalog.db.execute('''SELECT v.*,d.description FROM video_caption_vectors v
+                JOIN units u ON u.id=v.unit_id JOIN unit_details d ON d.unit_id=v.unit_id
+                WHERE u.asset_id=? AND v.file_version=? AND v.model_version=?''',(asset['id'],asset['version'],EMBED_VERSION)):
+                scene_rows.append(base | dict(unit_id=scene['unit_id'],model_version=EMBED_VERSION,
+                    vector=np.frombuffer(scene['vector'],dtype=np.float32).tolist(),search_text=scene['description']))
+        return ids, context_rows, face_rows, scene_rows
 
-    def write_auxiliary(self, ids, context_rows, face_rows):
+    def write_auxiliary(self, ids, context_rows, face_rows, scene_rows=()):
         if not ids:
             return
         condition = "asset_id IN (" + ",".join(str(i) for i in ids) + ")"
-        for table, rows, schema in ((self.contexts, context_rows, SCHEMA), (self.faces, face_rows, FACE_SCHEMA)):
+        for table, rows, schema in ((self.contexts, context_rows, SCHEMA), (self.faces, face_rows, FACE_SCHEMA), (self.scenes,scene_rows,SCHEMA)):
             if table.count_rows():
                 table.delete(condition)
             if rows:
@@ -98,7 +104,10 @@ class SearchIndex:
             place = json.loads(asset.get("geo_json") or "{}")
             text = " ".join([asset["filename"], asset["relative_path"], asset["description"], asset.get("geo_text", ""),
                              " ".join(place.get("alternate_names", [])),
-                             " ".join(observations.get("objects", [])), " ".join(observations.get("actions", []))])
+                             " ".join(observations.get("objects", [])), " ".join(observations.get("actions", [])),
+                             observations.get('audio_description', ''), observations.get('speech', ''),
+                             " ".join(person.get('name','') for person in observations.get('people', [])),
+                             " ".join(event.get('description','') for event in observations.get('events', []) if isinstance(event, dict))])
             row = {name: asset[name] for name in ("version", "folder", "captured_at", "camera", "extension", "orientation", "width", "height", "pixels", "size", "present", "metadata_ready")}
             row.update(unit_id=unit_id, asset_id=asset["id"], model_version=EMBED_VERSION, vector=values.tolist(), search_text=text)
             rows.append(row)
@@ -123,7 +132,7 @@ class SearchIndex:
             return
         self.last_cleanup = now
         try:
-            for table in (self.table, self.faces, self.contexts):
+            for table in (self.table, self.faces, self.contexts,self.scenes):
                 table.optimize(cleanup_older_than=timedelta(minutes=10), delete_unverified=False)
         except Exception:
             # Committed index writes are still valid and can be acknowledged.
@@ -237,6 +246,16 @@ class SearchIndex:
                                       .select(["asset_id", "version", "_distance"]).limit(limit).offset(offset).to_list()):
                 scores[row["asset_id"]] = scores.get(row["asset_id"], 0) + 1 / (60 + offset + rank)
                 versions[row["asset_id"]] = row["version"]
+        if query and vector is not None and self.scenes.count_rows():
+            seen=set()
+            for rank,row in enumerate(self.scenes.search(np.asarray(vector,dtype=np.float32)).metric('cosine').where(where,prefilter=True)
+                .select(['unit_id','asset_id','version','_distance']).limit(limit).offset(offset).to_list()):
+                moments.setdefault(row['asset_id'],[]).append(row['unit_id'])
+                if row['asset_id'] in seen:continue
+                seen.add(row['asset_id'])
+                scores[row['asset_id']]=scores.get(row['asset_id'],0)+1/(60+offset+rank)
+                versions[row['asset_id']]=row['version']
+                matches.setdefault(row['asset_id'],row['unit_id'])
         if terms and any("search_text" in idx.columns for idx in self.table.list_indices()):
             # Query syntax is generated from literal tokens, never passed through as executable grammar.
             text = " ".join(terms)

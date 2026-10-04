@@ -67,10 +67,10 @@ class FaceModels:
                 raise GPUUnavailable("Модель лиц не запущена на видеокарте.")
             self.sessions[name] = session
 
-    def detect(self, rgb):
+    def detect(self, rgb, sides=(960,320)):
         height, width = rgb.shape[:2]
         predictions = []
-        for side in (960, 320):
+        for side in sides:
             factor = side / max(height, width)
             w, h = max(1, round(width * factor)), max(1, round(height * factor))
             prepared = np.zeros((960, 960, 3), dtype=np.uint8)
@@ -101,11 +101,25 @@ class FaceModels:
     def process(self, path):
         return self.process_pil(open_rgb(Path(path)))
 
-    def process_pil(self, image):
+    def process_pil(self, image, detail=False):
         rgb = np.asarray(image)
         height, width = rgb.shape[:2]
+        detections=self.detect(rgb)
+        if detail and max(width,height)>1440:
+            # Overlapping full-resolution tiles recover small background faces.
+            # SFace alignment always uses the original decoded video pixels.
+            def starts(length):
+                return sorted(set([*range(0,max(1,length-1440),1152),max(0,length-1440)]))
+            for top in starts(height):
+                for left in starts(width):
+                    offset=np.array([left,top])
+                    for box,points,confidence in self.detect(rgb[top:top+1440,left:left+1440],(960,)):
+                        detections.append((box+np.tile(offset,2),points+offset,confidence))
+            if detections:
+                keep=nms(np.array([d[0] for d in detections]),np.array([d[2] for d in detections]))
+                detections=[detections[i] for i in keep]
         records = []
-        for box, landmarks, confidence in self.detect(rgb):
+        for box, landmarks, confidence in detections:
             aligned = cv2.warpAffine(rgb, similarity_transform(landmarks), (112, 112), flags=cv2.INTER_LINEAR)
             vector = self.sessions["sface"].run(None, {"data": aligned.transpose(2, 0, 1)[None].astype(np.float32)})[0].reshape(-1)
             if not np.isfinite(vector).all() or np.linalg.norm(vector) < 1e-8:

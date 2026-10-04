@@ -19,6 +19,9 @@ try {
     foreach ($document in @('VALIDATION.md', 'VALIDATION-v064.md', 'VALIDATION-v070.md', 'VALIDATION-v071.md', 'VALIDATION-v072.md', 'VALIDATION-v080.md', 'VALIDATION-v081.md', 'VALIDATION-v082.md', 'VALIDATION-v083.md', 'VALIDATION-v084.md', 'VALIDATION-v085.md', 'VALIDATION-v086.md', 'VALIDATION-v087.md', 'CATALOG-v070.md', 'README.md', 'requirements.lock')) {
         if (Test-Path -LiteralPath $document) { Copy-Item -LiteralPath $document -Destination (Join-Path $bundleDir $document) }
     }
+    foreach ($document in @('VIDEO-v090.md','VALIDATION-v090.md')) {
+        if (Test-Path -LiteralPath $document) { Copy-Item -LiteralPath $document -Destination (Join-Path $bundleDir $document) }
+    }
 } finally {
     $env:FOTOARCHIVE_EXE_ONLY = $previousExeOnly
     Pop-Location

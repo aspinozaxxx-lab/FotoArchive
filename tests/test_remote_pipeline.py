@@ -74,6 +74,7 @@ def test_fast_photo_reaches_server_while_another_source_is_still_preparing(trans
         assert slow.wait(2)
         transport.queue.put((2,dict(id=2,filename='fast.jpg'),stages))
         wait_until(lambda:supervisor.store.stats(transport.session_id)['queued']==1)
+        wait_until(lambda:2 in transport.pending)
         assert not release.is_set()
         with transport.pending_lock:assert 2 in transport.pending and 1 not in transport.pending
         assert transport.transfer_status()['preparing']==1
@@ -144,7 +145,7 @@ def test_status_explains_preparation_instead_of_empty_server_queue(qtbot,tmp_pat
     panel.update_status(dict(state='ready',queued=0,running=0,upload_queue=61,preparing=3,prepared=0,
                              uploading='preparing',transfer_file='IMG_001.HEIC',cache_bytes=20*1024**3,
                              cache_limit=20*1024**3,cache_pending_bytes=0,cache_reusable_bytes=20*1024**3))
-    assert panel.state.text()=='Ожидает подготовку снимков'
+    assert panel.state.text()=='Ожидает подготовку медиа'
     assert panel.job_values['upload_queue'].text()=='61' and panel.job_values['preparing'].text()=='3'
     assert 'автоматически: 20.0 ГБ' in panel.cache_details.text()
     assert panel.transfer_file.toolTip()=='IMG_001.HEIC'

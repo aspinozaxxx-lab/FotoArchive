@@ -4,7 +4,7 @@ import json
 import zlib
 
 MAGIC = b'FotoArchive-Cache\x00\x01'
-MAX_INPUT = 64 * 1024**2
+MAX_INPUT = 256 * 1024**2
 MAX_PACKED = MAX_INPUT + 65536
 MAX_PENDING = 8192
 UPLOAD_AHEAD = 64

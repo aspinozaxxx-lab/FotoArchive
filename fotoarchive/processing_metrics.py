@@ -2,7 +2,7 @@
 from collections import Counter, deque
 import time
 
-STAGES = ('embedding', 'faces', 'caption', 'location')
+STAGES = ('embedding', 'faces', 'caption', 'location', 'video')
 
 
 class ProcessingMetrics:

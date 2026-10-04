@@ -71,6 +71,8 @@ def main():
     cfg = Settings(data_dir=Path(os.environ['FOTOARCHIVE_REMOTE_DATA']))
     cfg.initialize()
     embedder = faces = vision = None
+    from .video_runtime import VideoOwner
+    video_owner = VideoOwner(cfg, cuda=True)
     profiled = set()
 
     def proof(name,session):
@@ -96,13 +98,52 @@ def main():
         output = dict(id=job['id'],stages={},errors={},providers={})
         try:
             raw = unpack(Path(job['blob']).read_bytes())
-            with Image.open(io.BytesIO(raw)) as source:
-                source.load()
-                image = ImageOps.exif_transpose(source).convert('RGB')
+            if 'video' in job['stages']:
+                from .video_content import VideoInput
+                data = VideoInput.decode(raw)
+                image = None
+            else:
+                with Image.open(io.BytesIO(raw)) as source:
+                    source.load()
+                    image = ImageOps.exif_transpose(source).convert('RGB')
             del raw
             for stage in job['stages']:
                 try:
-                    if stage=='embedding':
+                    if stage=='video':
+                        from .video_worker import analyze
+                        from .config import VIDEO_INTERN_REV, VIDEO_OMNI_REV, QWEN_REV
+                        model_name = job['context']['model']
+                        if vision and model_name=='omni':
+                            vision.close(); vision = None
+                        embedder = embedder or Embedder(cfg,profile=True,provider='CUDAExecutionProvider')
+                        faces = faces or FaceModels(cfg,profile=True,provider='CUDAExecutionProvider')
+                        evidence = {}
+                        def describe_video(data, labelled, bindings, batches):
+                            value = video_owner.run(dict(blob=job['blob'], model=model_name,
+                                people=job['context'].get('people', []),
+                                faces=[[dict(box=f['box'], vector=f['vector'].tolist()) for f in batch] for batch in batches]))
+                            evidence.update(value.get('gpu_proof', {}))
+                            return value['caption']
+                        value = analyze(data, embedder, faces, describe_video, job['context'].get('people', []))
+                        from .video_caption import structure_narrative,needs_translation,caption_vector
+                        if model_name=='internvideo' or needs_translation(value['caption']):
+                            vision = vision or CudaVision(cfg)
+                            source = value['caption']['narrative'] if model_name=='internvideo' else json.dumps(value['caption'],ensure_ascii=False)
+                            value['caption'] = structure_narrative(vision,source,data.metadata,data.has_audio and model_name=='omni')
+                        value['text_vector']=caption_vector(embedder,value['caption']).tolist()
+                        value.update(model=('MiniCPM-o 4.5:'+VIDEO_OMNI_REV if model_name=='omni' else 'InternVideo2.5:'+VIDEO_INTERN_REV),
+                                     backend='CUDA BF16', formatter_model='Qwen3-VL-4B Q4_K_M:'+QWEN_REV,
+                                     audio_used=data.has_audio and model_name=='omni', gpu_proof=evidence)
+                        output['stages'][stage] = value
+                        output['providers'][stage] = 'CUDA (video + audio + SigLIP + faces)' if model_name=='omni' else 'CUDA (video + SigLIP + faces)'
+                        for name,session in [('siglip',embedder._session('vision')),('siglip-text',embedder._session('text')),*faces.sessions.items()]:
+                            if name!='sface' or any(frame['faces'] for frame in value['frames']):
+                                verified = proof(name,session)
+                                if verified:
+                                    output.setdefault('gpu_proof',{})[name]=verified
+                                    value['gpu_proof'][name]=verified
+                        del data
+                    elif stage=='embedding':
                         embedder = embedder or Embedder(cfg,profile=True,provider='CUDAExecutionProvider')
                         output['stages'][stage] = embedder.prepared_images([embedder.prepare_pil(image)])[0].tolist()
                         output['providers'][stage] = embedder._session('vision').get_providers()[0]
@@ -125,6 +166,7 @@ def main():
                                 if evidence:
                                     output.setdefault('gpu_proof',{})[name]=evidence
                     elif stage=='caption':
+                        video_owner.close()
                         vision = vision or CudaVision(cfg)
                         preview = image.copy()
                         preview.thumbnail((1008,1008),Image.Resampling.LANCZOS)
