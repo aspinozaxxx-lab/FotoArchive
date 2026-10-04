@@ -5,6 +5,7 @@ import json
 import queue
 import time
 import traceback
+import numpy as np
 from collections import deque
 from contextlib import ExitStack
 from pathlib import Path
@@ -22,6 +23,9 @@ class Engine:
     def __init__(self, cfg: Settings, emit=lambda event: None):
         self.cfg, self.emit = cfg, emit
         cfg.initialize()
+        if (cfg.data_dir/'models/video-omni/MiniCPM-o-4_5-Q4_K_M.gguf').is_file():
+            from .video_setup import install_runtime
+            install_runtime(cfg)
         self.lock = FileLock(cfg.data_dir / "worker.lock")
         try:
             self.lock.acquire(timeout=0)
@@ -56,6 +60,10 @@ class Engine:
 
     def vision(self):
         if self.vlm is None:
+            # Interactive verification takes priority and cannot share the
+            # 12 GiB device with the large audiovisual language model.
+            if self.pipeline.videos.pending:
+                self.pipeline.videos.cancel()
             self.vlm = VisionLanguage(self.cfg)
         return self.vlm
 
@@ -302,6 +310,9 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                 engine.embedder = engine.face_models = None
             try:
                 pipeline.inventory.collect()
+                pipeline.refresh_people()
+                if pipeline.videos.collect():
+                    maintenance_needed = True
                 if pipeline.captions.collect():
                     pipeline.gpu_completed += 1
                     maintenance_needed = True
@@ -312,6 +323,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                 pipeline.cpu.recover_broken()
                 pipeline.inputs.cancel()
                 pipeline.captions.cancel()
+                pipeline.videos.cancel()
                 if isinstance(exc,GPUUnavailable) and cfg.remote_enabled:
                     cfg.local_enabled = False
                     cfg.save()
@@ -342,6 +354,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                         paused = True
                         pipeline.inputs.cancel()
                         pipeline.captions.cancel()
+                        pipeline.videos.cancel()
                         pipeline.cpu.cancel()
                         engine.catalog.set_state("paused", True)
                     elif action == 'remote_enabled':
@@ -357,6 +370,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                         if not cfg.local_enabled:
                             pipeline.inputs.cancel()
                             pipeline.captions.cancel()
+                            pipeline.videos.cancel()
                         else:
                             paused = False
                             engine.catalog.set_state('paused',False)
@@ -386,6 +400,21 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                         engine.catalog.retry_errors()
                         paused = False
                         engine.catalog.set_state('paused',False)
+                    elif action in ('video_model', 'rebuild_videos'):
+                        pipeline.videos.cancel()
+                        if pipeline.remote:
+                            pipeline.remote.cancel()
+                        if action == 'video_model':
+                            if command['model'] not in ('omni','internvideo'):
+                                raise ValueError('Неизвестная модель видео')
+                            cfg.video_model = command['model']
+                            cfg.save()
+                        from .video_archive import schedule
+                        count = schedule(engine.catalog, force=action == 'rebuild_videos')
+                        pipeline.videos.retry_at = 0
+                        paused = False
+                        engine.catalog.set_state('paused',False)
+                        emit(dict(type='message', message=f'Видео поставлены в очередь: {count}. Фотографии не пересчитываются.'))
                     elif action == "download_models":
                         from .bootstrap import main as download
                         download(cfg, lambda text: emit({"type": "working", "stage": "setup", "filename": text}))
@@ -486,7 +515,13 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                             if command.get('people'):
                                 vector = []
                                 for person in command['people']:
-                                    faces, vectors = resolve_examples(engine.catalog, person['examples'])
+                                    from .video_people import person_vectors
+                                    saved = person_vectors(engine.catalog, person.get('id'))
+                                    if saved:
+                                        faces = [info for key in person['examples'] if (info := engine.catalog.face_info(key))]
+                                        vectors = [np.asarray(v,dtype=np.float32) for v in saved]
+                                    else:
+                                        faces, vectors = resolve_examples(engine.catalog, person['examples'])
                                     examples.extend(faces)
                                     vector.extend(vectors)
                                     face_groups.append(dict(vectors=vectors, rejected=person.get('rejected', [])))
@@ -561,11 +596,14 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                     if cfg.local_enabled:
                         pipeline.inputs.fill()
                     if cfg.local_enabled and not checking and reviewing is None:
-                        pipeline.captions.fill()
+                        if not pipeline.videos.fill() and not pipeline.videos.pending:
+                            pipeline.videos.release()
+                            pipeline.captions.fill()
                 except Exception as exc:
                     pipeline.cpu.cancel()
                     pipeline.inputs.cancel()
                     pipeline.captions.cancel()
+                    pipeline.videos.cancel()
                     if isinstance(exc,GPUUnavailable) and cfg.remote_enabled:
                         cfg.local_enabled = False
                         cfg.save()
@@ -604,7 +642,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                 try:
                     job = pipeline.process_gpu() if cfg.local_enabled else None
                     maintenance_needed = True
-                    unfinished = (not cfg.local_enabled and engine.catalog.db.execute("""SELECT 1 FROM jobs j JOIN assets a ON a.id=j.asset_id
+                    unfinished = (engine.catalog.db.execute("""SELECT 1 FROM jobs j JOIN assets a ON a.id=j.asset_id
                         WHERE j.status IN ('pending','running') AND a.present=1 AND j.file_version=a.version LIMIT 1""").fetchone()) if job is None and pipeline.idle else True
                     if job is None and pipeline.idle and not unfinished:
                         pipeline.cpu.close()
@@ -623,6 +661,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                     pipeline.cpu.cancel()
                     pipeline.inputs.cancel()
                     pipeline.captions.cancel()
+                    pipeline.videos.cancel()
                     engine.catalog.set_state("paused", paused)
                     emit({"type": "error", "message": str(exc)})
                 except Exception as exc:
@@ -630,9 +669,10 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                     pipeline.cpu.cancel()
                     pipeline.inputs.cancel()
                     pipeline.captions.cancel()
+                    pipeline.videos.cancel()
                     engine.catalog.set_state("paused",True)
                     emit({"type": "error", "message": str(exc)})
-            elif maintenance_needed and not checking and not pipeline.cpu.pending and not pipeline.captions.pending:
+            elif maintenance_needed and not checking and not pipeline.cpu.pending and not pipeline.captions.pending and not pipeline.videos.pending:
                 engine.index.flush_all()
                 engine.index.maintain()
                 maintenance_needed = False
@@ -640,6 +680,7 @@ def worker_main(data_dir, commands, events, shutdown, interactive_state=None, re
                 status = {"type": "status", "stats": engine.catalog.stats(), "paused": paused,
                       "processing_metrics":engine.metrics.snapshot(),
                       "local_enabled":cfg.local_enabled,"remote_enabled":cfg.remote_enabled,
+                      "video_model":cfg.video_model,
                       "scanning":pipeline.scanning, "scan":pipeline.scan_state,"pipeline":pipeline.status(),
                       "inventory": pipeline.inventory.status()}
                 emit(status)

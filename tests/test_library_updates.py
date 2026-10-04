@@ -200,6 +200,8 @@ def test_video_replacement_and_removal_delete_every_frame_from_search(tmp_path):
     job = cat.next_job(('metadata',))
     cat.complete_metadata(job, metadata, path, 'test')
     cat.finish_job(job, .1)
+    # A legacy video still has to be removed from the index on replacement.
+    cat.db.execute("DELETE FROM jobs WHERE asset_id=? AND stage='video'",(asset_id,));cat.db.commit()
     for _ in range(3):
         job = cat.next_job(('embedding',))
         cat.complete_embedding(job, np.ones(768, dtype=np.float32))
@@ -217,6 +219,7 @@ def test_video_replacement_and_removal_delete_every_frame_from_search(tmp_path):
         job = cat.next_job(('metadata',))
         cat.complete_metadata(job, metadata, path, 'new')
         cat.finish_job(job, .1)
+        cat.db.execute("DELETE FROM jobs WHERE asset_id=? AND stage='video'",(asset_id,));cat.db.commit()
         job = cat.next_job(('embedding',))
         cat.complete_embedding(job, np.ones(768, dtype=np.float32))
         cat.finish_job(job, .1)

@@ -100,9 +100,14 @@ class Store:
 
     def submit(self, session, blob, stages, context=None):
         context = context or {}
-        if len(json.dumps(context))>12000:
+        if len(json.dumps(context))>256*1024:
             raise ValueError('Context too large')
-        if not stages or len(stages)>4 or any(VERSIONS.get(k)!=v for k,v in stages.items()):
+        from types import SimpleNamespace
+        from .video_archive import pipeline_version
+        allowed = VERSIONS | {'video': pipeline_version(SimpleNamespace(video_model=context.get('model','omni')))}
+        if context.get('model','omni') not in ('omni','internvideo'):
+            raise ValueError('Unknown video model')
+        if not stages or len(stages)>4 or any(allowed.get(k)!=v for k,v in stages.items()):
             raise ValueError('Model versions do not match')
         key = job_key(blob, stages,context)
         with self.lock, self.db:

@@ -99,12 +99,13 @@ class SearchSession:
             for hit in hits:
                 # The global score order makes the first hit for a photograph its best
                 # match, including when multiple examples or multiple faces match it.
-                asset = self.catalog.db.execute("SELECT id,version FROM assets WHERE id=? AND present=1", (hit["asset_id"],)).fetchone()
+                asset = self.catalog.db.execute("SELECT id,version,media_kind FROM assets WHERE id=? AND present=1", (hit["asset_id"],)).fetchone()
                 if asset and asset["version"] == hit["version"]:
                     face = self.catalog.face_info(hit['unit_id']) or {}
                     if self.face_groups:
                         from .face_search import matches_people
-                        if not matches_people(self.catalog, asset['id'], face.get('unit_id'), self.face_groups, self.people_mode=='all'):
+                        unit = None if asset['media_kind'] == 'video' else face.get('unit_id')
+                        if not matches_people(self.catalog, asset['id'], unit, self.face_groups, self.people_mode=='all'):
                             continue
                     items.append(dict(asset) | {"face_score": hit["face_score"], "face_match_id": hit["unit_id"], 'unit_id': face.get('unit_id')})
             self.exhausted = not more

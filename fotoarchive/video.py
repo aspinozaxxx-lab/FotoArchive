@@ -29,7 +29,10 @@ def search_coverage_text(asset):
     from .config import EMBED_VERSION
     state = ('Поисковая обработка ещё не завершена; доступны готовые кадры. '
              if asset.get('embed_version') != EMBED_VERSION else '')
-    return state+f'Поиск по кадрам через {VIDEO_INTERVAL_MS//1000} секунд; короткие события между ними могут быть пропущены. Проверка условий относится к отдельному кадру.'
+    observations = json.loads(asset.get('observations_json') or '{}')
+    if observations.get('scope') in ('segment','video') or asset.get('description_scope')=='segment':
+        return state+'Описание последовательных отрезков видео; поиск по моментам и людям. Между кадрами выборки короткие события могут быть пропущены.'
+    return state+f'Предыдущий индекс: кадры через {VIDEO_INTERVAL_MS//1000} секунд. Описание видео обновляется постепенно.'
 
 
 def _stream(container):

@@ -199,6 +199,8 @@ class Catalog:
         self.source_id = self.db.execute("SELECT id FROM sources WHERE root=?", (str(cfg.root.resolve()),)).fetchone()[0]
         from .media_units import MediaUnits
         self.media_units = MediaUnits(self)
+        from .video_archive import initialize as initialize_video
+        initialize_video(self)
         from .library import initialize_library
         initialize_library(self.db)
         self.db.executescript('''
@@ -248,6 +250,8 @@ class Catalog:
                 self.db.execute(f"""INSERT OR IGNORE INTO jobs(asset_id,stage,file_version,model_version)
                     SELECT id,?,version,? FROM assets WHERE present=1 AND ({column} IS NULL OR {column}<>?)""", (stage, version, version))
                 self.db.execute("UPDATE jobs SET status='pending',model_version=? WHERE stage=? AND model_version<>?", (version, stage, version))
+        from .video_archive import schedule
+        schedule(self)
 
     def register(self, path: Path):
         path = path.resolve()
@@ -287,6 +291,10 @@ class Catalog:
             self.db.execute('UPDATE assets SET media_kind=? WHERE id=?', ('video' if path.suffix.lower() in VIDEO_FORMATS else 'photo', asset_id))
             for stage, model in (("metadata", MEDIA_VERSION), ("embedding", EMBED_VERSION), ("caption", CAPTION_VERSION), ("faces", FACE_VERSION), ("location", GEO_VERSION)):
                 self.db.execute("INSERT OR REPLACE INTO jobs(asset_id,stage,file_version,model_version) VALUES(?,?,?,?)", (asset_id, stage, version, model))
+            if path.suffix.lower() in VIDEO_FORMATS:
+                from .video_archive import pipeline_version
+                self.db.execute("INSERT OR REPLACE INTO jobs(asset_id,stage,file_version,model_version) VALUES(?,'video',?,?)",
+                                (asset_id, version, pipeline_version(self.cfg)))
             if old:
                 self._enqueue(asset_id, version)
         return asset_id, True
@@ -303,6 +311,10 @@ class Catalog:
         return self.media_units.asset_at(self.get(job['asset_id']), job.get('unit_id'))
 
     def current_job(self, job):
+        if job.get('stage') == 'video':
+            from .video_archive import pipeline_version
+            if job.get('model_version') != pipeline_version(self.cfg):
+                return False
         return self.db.execute('SELECT 1 FROM assets WHERE id=? AND version=? AND present=1',
                                (job['asset_id'], job['file_version'])).fetchone() is not None
 
@@ -313,6 +325,7 @@ class Catalog:
             row = self.db.execute("""SELECT j.asset_id,j.stage,j.file_version,j.model_version FROM jobs j
               JOIN assets a ON a.id=j.asset_id WHERE j.status='pending' AND j.stage=? AND a.present=1
               AND j.file_version=a.version AND (j.stage='metadata' OR a.metadata_ready=1)"""+asset_clause+
+              (" AND (a.media_kind<>'video' OR NOT EXISTS(SELECT 1 FROM jobs v WHERE v.asset_id=a.id AND v.stage='video'))" if stage in ('embedding','caption','faces') else '') +
               " ORDER BY j.asset_id LIMIT 1", [stage]+([asset_id] if asset_id is not None else [])).fetchone()
             if row:
                 break
@@ -341,12 +354,13 @@ class Catalog:
             if indexed and any(indexed):
                 self._enqueue(asset_id, job["file_version"])
 
-    def complete_embedding(self, job, vector):
+    def complete_embedding(self, job, vector, commit=True):
         import numpy as np
         if not self.current_job(job):
             return
         vector = np.asarray(vector, dtype=np.float32)
-        with self.db:
+        from contextlib import nullcontext
+        with self.db if commit else nullcontext():
             self.db.execute("INSERT OR REPLACE INTO embeddings VALUES(?,?,?,?,?)", (job.get('unit_id', f"{job['asset_id']}:photo"), job["file_version"], EMBED_VERSION, len(vector), vector.tobytes()))
             if not job.get('unit_id'):
                 self.db.execute("UPDATE assets SET embed_version=? WHERE id=? AND version=?", (EMBED_VERSION, job["asset_id"], job["file_version"]))
@@ -379,7 +393,7 @@ class Catalog:
             self.db.execute("UPDATE units SET location_json=? WHERE asset_id=?", (json.dumps(location, ensure_ascii=False), job["asset_id"]))
             self._enqueue(job["asset_id"], job["file_version"])
 
-    def complete_faces(self, job, records):
+    def complete_faces(self, job, records, commit=True):
         import numpy as np
         if not self.current_job(job):
             return
@@ -397,7 +411,8 @@ class Catalog:
             temporary.replace(target)
             prepared.append((face_id, job["asset_id"], job["file_version"], FACE_VERSION,
                              json.dumps(face["box"]), json.dumps(face["landmarks"]), face["confidence"], face["vector"].astype(np.float32).tobytes(), str(target)))
-        with self.db:
+        from contextlib import nullcontext
+        with self.db if commit else nullcontext():
             if job.get('unit_id'):
                 self.db.execute('DELETE FROM faces WHERE id IN (SELECT face_id FROM face_units WHERE unit_id=?)', (job['unit_id'],))
             else:
@@ -443,10 +458,16 @@ class Catalog:
                 previous = self.db.execute('SELECT status FROM jobs WHERE asset_id=? AND stage=? AND file_version=?',
                     (job['asset_id'],job['stage'],job['file_version'])).fetchone()
         with self.db:
-            if job.get('unit_id'):
+            if job.get('unit_id') and job['stage'] == 'video':
+                from .video_archive import finish
+                finish(self, job, elapsed, error)
+            elif job.get('unit_id'):
                 self.media_units.finish(job, elapsed, error)
             else:
                 self.db.execute("UPDATE jobs SET status=?,error=?,elapsed=? WHERE asset_id=? AND stage=? AND file_version=?", ("error" if error else "done", error, elapsed, job["asset_id"], job["stage"], job["file_version"]))
+                if job['stage']=='metadata' and error:
+                    self.db.execute("UPDATE jobs SET status='error',error=? WHERE asset_id=? AND stage='video' AND file_version=?",
+                        (error,job['asset_id'],job['file_version']))
         if observer and previous and previous[0] != ('error' if error else 'done'):
             observer(job, error, source)
 
@@ -477,9 +498,10 @@ class Catalog:
         return [dict(r) for r in rows], total
 
     def stats(self):
+        from .video_archive import pipeline_version
         result = dict(self.db.execute("""SELECT count(*) total,sum(metadata_ready) metadata,
-          sum(embed_version=?) embeddings,sum(caption_version=?) captions,
-          sum(metadata_ready=1 AND captured_at IS NULL) unknown_dates FROM assets WHERE present=1""", (EMBED_VERSION, CAPTION_VERSION)).fetchone())
+          sum(embed_version=?) embeddings,sum(caption_version=? OR (media_kind='video' AND caption_version=?)) captions,
+          sum(metadata_ready=1 AND captured_at IS NULL) unknown_dates FROM assets WHERE present=1""", (EMBED_VERSION, CAPTION_VERSION,pipeline_version(self.cfg))).fetchone())
         result = {k: v or 0 for k, v in result.items()}
         result["errors"] = self.db.execute("SELECT count(*) FROM jobs j JOIN assets a ON a.id=j.asset_id WHERE j.status='error' AND a.present=1").fetchone()[0]
         result["pending"] = self.db.execute("SELECT count(*) FROM jobs j JOIN assets a ON a.id=j.asset_id WHERE j.status IN ('pending','running') AND a.present=1 AND j.file_version=a.version").fetchone()[0]
@@ -487,6 +509,12 @@ class Catalog:
         result["faces"], result["locations"] = self.db.execute("SELECT coalesce(sum(face_version=?),0),coalesce(sum(geo_version=?),0) FROM assets WHERE present=1", (FACE_VERSION, GEO_VERSION)).fetchone()
         result['video_frames'] = {row['stage']: row['n'] for row in self.db.execute("SELECT j.stage,count(*) n FROM unit_jobs j JOIN units u ON u.id=j.unit_id JOIN assets a ON a.id=u.asset_id WHERE j.status='done' AND a.present=1 AND j.file_version=a.version GROUP BY j.stage")}
         result['video_frames']['total'] = self.db.execute("SELECT count(*) FROM units u JOIN assets a ON a.id=u.asset_id WHERE u.kind='frame' AND a.present=1").fetchone()[0]
+        result['video_segments'] = dict(self.db.execute('''SELECT count(*) total,
+            coalesce(sum(j.status='done'),0) done,coalesce(sum(j.status='running'),0) running,
+            coalesce(sum(j.status='error'),0) errors FROM unit_jobs j JOIN units u ON u.id=j.unit_id
+            JOIN assets a ON a.id=u.asset_id WHERE j.stage='video' AND a.present=1 AND j.file_version=a.version''').fetchone())
+        result['video_files'] = dict(self.db.execute('''SELECT count(*) total,coalesce(sum(j.status='done'),0) done
+            FROM jobs j JOIN assets a ON a.id=j.asset_id WHERE j.stage='video' AND a.present=1 AND j.file_version=a.version''').fetchone())
         return result
 
     def name_matches(self, query: str, filters: Filters, limit=200, offset=0):

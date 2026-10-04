@@ -18,6 +18,9 @@ def initialize_library(db):
       CREATE INDEX IF NOT EXISTS assets_stack_input ON assets(present,metadata_ready,media_kind,folder,camera,captured_at,id);
       CREATE TABLE IF NOT EXISTS people(id TEXT PRIMARY KEY,name TEXT NOT NULL,
         examples TEXT NOT NULL,rejected TEXT NOT NULL,cover TEXT);
+      CREATE TABLE IF NOT EXISTS person_templates(person_id TEXT NOT NULL REFERENCES people(id) ON DELETE CASCADE,
+        face_id TEXT NOT NULL,vector BLOB NOT NULL,model_version TEXT NOT NULL,
+        PRIMARY KEY(person_id,face_id));
       CREATE TABLE IF NOT EXISTS stack_exclusions(asset_id INTEGER PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS stack_covers(stack_key TEXT PRIMARY KEY,asset_id INTEGER NOT NULL);
       INSERT OR IGNORE INTO app_state VALUES('library_revision','0');
@@ -25,6 +28,11 @@ def initialize_library(db):
         UPDATE app_state SET value=CAST(value AS INTEGER)+1 WHERE key='library_revision';
       END;
     ''')
+    # Keep the user-approved template independent of mutable video detections.
+    # There are at most 128 examples per person; this is not an archive scan.
+    db.execute('''INSERT OR IGNORE INTO person_templates
+        SELECT p.id,f.id,f.vector,f.model_version FROM people p JOIN json_each(p.examples) e
+        JOIN faces f ON f.id=e.value''')
     db.commit()
 
 
@@ -58,8 +66,20 @@ class Library:
             cover = examples[0]
         from contextlib import nullcontext
         with self.db if commit else nullcontext():
-            self.db.execute('INSERT OR REPLACE INTO people VALUES(?,?,?,?,?)',
+            templates=[]
+            from .config import FACE_VERSION
+            for face_id in examples:
+                old=self.db.execute('SELECT vector,model_version FROM person_templates WHERE face_id=? ORDER BY person_id=? DESC LIMIT 1',
+                    (face_id,key)).fetchone()
+                vector=self.catalog.face_vector(face_id) if old is None else None
+                if old:
+                    templates.append((key,face_id,old['vector'],old['model_version']))
+                elif vector is not None:
+                    templates.append((key,face_id,vector.tobytes(),FACE_VERSION))
+            self.db.execute('INSERT INTO people VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,examples=excluded.examples,rejected=excluded.rejected,cover=excluded.cover',
                             (key, name, json.dumps(examples), json.dumps(rejected), cover))
+            self.db.execute('DELETE FROM person_templates WHERE person_id=? AND face_id NOT IN ('+','.join('?' for _ in examples)+')',[key,*examples])
+            self.db.executemany('INSERT OR IGNORE INTO person_templates VALUES(?,?,?,?)',templates)
         return key
 
     def merge_people(self, ids):
@@ -180,6 +200,9 @@ class Library:
             with self.db:
                 self.db.execute('INSERT OR IGNORE INTO stack_exclusions VALUES(?)', (command['asset_id'],))
                 self.db.execute("UPDATE app_state SET value=CAST(value AS INTEGER)+1 WHERE key='browse_revision'")
+        if action in ('save_person','merge_people','split_person','delete_person'):
+            from uuid import uuid4
+            self.catalog.set_state('video_people_revision', uuid4().hex)
         return dict(type=command['action'], serial=command.get('serial'), **payload)
 
 

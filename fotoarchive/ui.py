@@ -93,7 +93,7 @@ class Backend(QObject):
             self.remote_lifetime[2] = int(bool(message['enabled']))
         if action in ('pause','stop'):
             self.remote_lifetime[1] = 0
-        elif action in ('resume','scan','check_updates','add_folder','add_folders','retry'):
+        elif action in ('resume','scan','check_updates','add_folder','add_folders','retry','video_model','rebuild_videos'):
             self.remote_lifetime[1] = 1
         elif action in ('remote_enabled','local_enabled') and message.get('enabled'):
             self.remote_lifetime[1] = 1
@@ -1365,6 +1365,17 @@ class MainWindow(Workspace, QMainWindow):
         if asset.get("face_score") is not None:
             blocks.append(f"<p>Сходство лиц: {asset['face_score']:.3f} · оценка модели</p>")
         if asset.get("description"):
+            try:
+                observation = json.loads(asset.get('observations_json') or '{}')
+            except (ValueError,TypeError):
+                observation = {}
+            if observation.get('scope') in ('segment','video'):
+                if observation.get('audio_description'):
+                    blocks.append('<h4>Звук</h4><p>'+html.escape(observation['audio_description'])+'</p>')
+                if observation.get('speech'):
+                    blocks.append('<h4>Речь</h4><p>'+html.escape(observation['speech'])+'</p>')
+                if observation.get('people'):
+                    blocks.append('<h4>Люди</h4><p>'+html.escape(', '.join(p['name'] for p in observation['people']))+'</p>')
             blocks += ["<h4>Описание · оценка модели</h4>", f"<p>{html.escape(asset['description'])}</p>"]
         else:
             blocks += ["<p style='color:#82909a'>Описание ещё не подготовлено.</p>"]
@@ -1665,7 +1676,7 @@ class MainWindow(Workspace, QMainWindow):
             if event.get("scanning") and not pipeline:
                 self.stage_label.setText("Сканирую выбранные папки…")
         elif kind == "working":
-            names = {"metadata": "Подготовка каталога", "embedding": "Поисковый индекс", "caption": "Описание фотографии", "query": "Сложный поиск", "faces": "Поиск лиц", "location": "Место съёмки", "orientation": "Проверка ориентации", "rotation": "Поворот и обновление поиска"}
+            names = {"metadata": "Подготовка каталога", "embedding": "Поисковый индекс", "caption": "Описание фотографии", "video": "Видео и звук", "query": "Сложный поиск", "faces": "Поиск лиц", "location": "Место съёмки", "orientation": "Проверка ориентации", "rotation": "Поворот и обновление поиска"}
             self.stage_label.setText(names.get(event["stage"], event["stage"]) + " · " + event["filename"])
         elif kind in {"catalog_ready", "ready", "scan_done", "index_done"}:
             if "includes" in event:

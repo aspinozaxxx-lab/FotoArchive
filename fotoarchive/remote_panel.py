@@ -1,6 +1,6 @@
 """Comparable device reports and an explicit remote delivery pipeline."""
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QWidget,QHBoxLayout,QVBoxLayout,QGridLayout,QCheckBox,QLabel,QFrame,QProgressBar,QLayout
+from PySide6.QtWidgets import QWidget,QHBoxLayout,QVBoxLayout,QGridLayout,QCheckBox,QLabel,QFrame,QProgressBar,QLayout,QComboBox,QPushButton
 from .processing_metrics import STAGES
 
 
@@ -50,7 +50,7 @@ class DeviceCard(QFrame):
         layout.addLayout(header)
         grid=QGridLayout();grid.setHorizontalSpacing(15);grid.setVerticalSpacing(2)
         self.counts,self.rates={},{}
-        for col,(stage,name) in enumerate(zip(STAGES,('Поиск','Лица','Описания','Места'))):
+        for col,(stage,name) in enumerate(zip(STAGES,('Поиск','Лица','Описания','Места','Видео'))):
             grid.addWidget(label(name,True),0,col)
             value=label('0');value.setStyleSheet('font-size: 13pt; font-weight: 600;')
             self.counts[stage]=value;grid.addWidget(value,1,col)
@@ -92,10 +92,25 @@ class RemotePanel(QWidget):
         self.enabled.toggled.connect(lambda enabled:changed('remote_enabled',enabled))
         devices.addWidget(self.local_card,1);devices.addWidget(self.remote_card,1)
         layout.addLayout(devices)
+        video = QHBoxLayout()
+        video.addWidget(label('Описание видео'))
+        self.video_model = QComboBox()
+        self.video_model.addItem('MiniCPM-o 4.5 · видео и звук', 'omni')
+        self.video_model.addItem('InternVideo2.5 · видеоряд на сервере', 'internvideo')
+        self.video_model.setCurrentIndex(max(0,self.video_model.findData(cfg.video_model)))
+        self.video_model.activated.connect(lambda _:backend.send(action='video_model',model=self.video_model.currentData()))
+        video.addWidget(self.video_model)
+        self.video_progress = label('')
+        video.addWidget(self.video_progress,1)
+        rebuild = QPushButton('Перестроить видео')
+        rebuild.setToolTip('Повторно обработать все видео выбранной моделью. Фотографии и исходные файлы не меняются. Готовые результаты доступны во время обработки.')
+        rebuild.clicked.connect(lambda:backend.send(action='rebuild_videos'))
+        video.addWidget(rebuild)
+        layout.addLayout(video)
         self.details=QWidget();details=QHBoxLayout(self.details)
         details.setContentsMargins(0,0,0,0);details.setSpacing(6)
         jobs,jobs_layout=card();jobs_layout.addWidget(label('Задания сервера'))
-        jobs.setToolTip('Одно задание — один снимок или кадр видео и все нужные ему этапы. Завершённым считается задание без ошибок. Сохранение подтверждается после записи результатов в каталог.')
+        jobs.setToolTip('Одно задание — снимок или отрезок видео до 30 секунд и все его этапы: описание, поиск, лица. Завершённым считается задание без ошибок. «В каталоге» — результат уже сохранён на ПК.')
         job_grid=QGridLayout();job_grid.setVerticalSpacing(0);job_grid.setHorizontalSpacing(12)
         self.job_values={}
         for i,(field,title) in enumerate((('queued','В очереди сервера'),('running','В работе'),('completed','Завершено'),
@@ -135,9 +150,15 @@ class RemotePanel(QWidget):
         self.warning=label();self.warning.setWordWrap(True);self.warning.hide();layout.addWidget(self.warning)
 
     def update_local(self,event):
+        if event.get('video_model'):
+            self.video_model.setCurrentIndex(max(0,self.video_model.findData(event['video_model'])))
         for source,device in (('local',self.local_card),('remote',self.remote_card)):
             device.update_metrics(event.get('processing_metrics',{}).get(source,{}))
         pipeline=event.get('pipeline',{})
+        files=event.get('stats',{}).get('video_files',{})
+        segments=event.get('stats',{}).get('video_segments',{})
+        self.video_progress.setText(f"Ролики {files.get('done',0)} / {files.get('total',0)} · отрезков готово {segments.get('done',0)}")
+        self.video_progress.setToolTip(pipeline.get('video_notice',''))
         if not event.get('local_enabled',True):
             state='Завершает описание' if pipeline.get('caption_running') else 'Выключено'
         elif event.get('paused'):
@@ -146,6 +167,8 @@ class RemotePanel(QWidget):
             state={'embedding':'Поиск','faces':'Лица','caption':'Описание','location':'Места'}.get(pipeline.get('gpu_stage'),'Ожидание')
             if pipeline.get('caption_running'):
                 state+=' + описания'
+            if pipeline.get('video_running'):
+                state='Видео и звук'
         self.local_card.state.setText(state)
 
     def update_status(self,status):
@@ -154,7 +177,7 @@ class RemotePanel(QWidget):
             gpu_unavailable='GPU недоступна',retrying='Повтор подключения к GPU')
         self.state.setText(names.get(status.get('state'),'Подключение…'))
         if status.get('state')=='ready':
-            if status.get('preparing'):self.state.setText('Ожидает подготовку снимков')
+            if status.get('preparing'):self.state.setText('Ожидает подготовку медиа')
             elif status.get('prepared') or status.get('uploading_count'):self.state.setText('Ожидает передачу снимков')
             elif status.get('upload_queue'):self.state.setText('Ожидает подготовку снимков')
             elif status.get('awaiting_save'):self.state.setText('Ожидает сохранение результатов')
@@ -165,7 +188,7 @@ class RemotePanel(QWidget):
         for prefix,total in (('upload','sent'),('download','received')):
             self.transfer_values[prefix+'_rate'].setText(amount(status.get(prefix+'_bps',0))+'/с' if online else '—')
             self.transfer_values[prefix+'_total'].setText(amount(status.get(total,0)))
-        transfer=dict(preparing='Подготовка снимков',uploading='Передача снимков',cache_full='Запас для обработки заполнен',idle='Ожидание следующего снимка')
+        transfer=dict(preparing='Подготовка медиа',uploading='Передача медиа',cache_full='Запас для обработки заполнен',idle='Ожидание следующего задания')
         text=transfer.get(status.get('uploading'),'') if online else 'Передача остановлена'
         if status.get('uploading_count') and online:text+=f" · {status['uploading_count']} одновременно"
         self.transfer_state.setText(text)
@@ -178,7 +201,7 @@ class RemotePanel(QWidget):
         required=status.get('cache_pending_bytes',0)
         reusable=status.get('cache_reusable_bytes',max(0,(size or 0)-required))
         self.cache_details.setText(f'Для текущих заданий: {amount(required)}\nМожно заменить автоматически: {amount(reusable)}' if size is not None else '')
-        stages={'embedding':'поиск','faces':'лица','caption':'описание','location':'место'}
+        stages={'embedding':'поиск','faces':'лица','caption':'описание','location':'место','video':'видео, звук, поиск и лица'}
         current=', '.join(stages.get(stage,stage) for stage in status.get('current_stages',[]))
         if current:self.state.setToolTip('Этапы текущего задания: '+current)
         gpu=status.get('gpu',{}) if online else {}

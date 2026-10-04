@@ -56,6 +56,9 @@ class UploadBody(io.BytesIO):
 
 
 def prepare(asset, cfg):
+    if 'video_start_ms' in asset:
+        from .video_content import decode_segment
+        return pack(decode_segment(asset).encode())
     path = Path(asset['path'])
     before = path.stat()
     if (before.st_size,before.st_mtime_ns)!=(asset['size'],asset['mtime_ns']):
@@ -245,7 +248,8 @@ class Transport:
             with self.activity_lock:self.preparing[serial] = asset.get('filename',Path(asset.get('path','')).name)
             try:
                 blob = prepare(asset,self.cfg)
-                context = {}
+                context = (dict(model=asset['video_model'], people=asset.get('video_people', []))
+                           if 'video' in stages else {})
                 if 'location' in stages:
                     from .location import Places,extract_location
                     places = Places(self.cfg)

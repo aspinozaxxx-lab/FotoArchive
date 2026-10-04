@@ -193,7 +193,7 @@ def serve(supervisor, token, host='127.0.0.1', port=18765):
                 self.connection.settimeout(15)
                 path = self.path.split('?')[0].strip('/').split('/')
                 length = int(self.headers.get('Content-Length','0'))
-                maximum = MAX_PACKED if path[0]=='blobs' else 16384
+                maximum = MAX_PACKED if path[0]=='blobs' else 384*1024 if path[0]=='jobs' else 16384
                 if not 0 <= length <= maximum:
                     raise ValueError('Request too large')
                 data = self.rfile.read(length) if length else b''
